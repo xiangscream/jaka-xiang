@@ -1,0 +1,40 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- Gazebo ros2_control plugin -->
+  <xacro:macro name="gazebo_ros2_control" params="name">
+    <gazebo>
+      <plugin name="gazebo_ros2_control" filename="libgazebo_ros2_control.so">
+        <robotNamespace>/${name}</robotNamespace>
+        <robotParam>robot_description</robotParam>
+      </plugin>
+    </gazebo>
+  </xacro:macro>
+
+  <!-- Apply gazebo materials to all links -->
+  <gazebo reference="base_link">
+    <material>Gazebo/DarkGrey</material>
+  </gazebo>
+  <gazebo reference="J1">
+    <material>Gazebo/Blue</material>
+  </gazebo>
+  <gazebo reference="J2">
+    <material>Gazebo/Blue</material>
+  </gazebo>
+  <gazebo reference="J3">
+    <material>Gazebo/Blue</material>
+  </gazebo>
+  <gazebo reference="J4">
+    <material>Gazebo/Grey</material>
+  </gazebo>
+  <gazebo reference="J5">
+    <material>Gazebo/Blue</material>
+  </gazebo>
+  <gazebo reference="J6">
+    <material>Gazebo/Grey</material>
+  </gazebo>
+
+  <!-- ros2_control plugin -->
+  <gazebo_ros2_control name="jaka_a5" />
+
+</robot>

@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>jaka_a5_control</name>
+  <version>0.1.0</version>
+  <description>JAKA A5 ros2_control Configuration</description>
+  <maintainer email="xiangscream@example.com">xiangscream</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>controller_manager</depend>
+  <depend>joint_state_broadcaster</depend>
+  <depend>joint_trajectory_controller</depend>
+  <depend>robot_state_publisher</depend>
+  <depend>xacro</depend>
+  <exec_depend>rviz2</exec_depend>
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

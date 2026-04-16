@@ -1,0 +1,12 @@
+planning_pipeline:
+  planners:
+    - name: ompl
+      default_planner: RRTConnectkConfigDefault
+
+OMPL:
+  default_planner_config: RRTConnectkConfigDefault
+  planner_configs:
+    RRTConnectkConfigDefault:
+      type: geometric::RRTConnectkConfigDefault
+      range: 0.0
+      goal_bias: 0.05

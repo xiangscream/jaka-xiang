@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>jaka_a5_gazebo</name>
+  <version>0.1.0</version>
+  <description>JAKA A5 Gazebo Simulation</description>
+  <maintainer email="xiangscream@example.com">xiangscream</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>gazebo_ros2_control</depend>
+  <depend>gazebo_ros_pkg</depend>
+  <depend>ros_gz_sim</depend>
+  <exec_depend>joint_state_publisher</exec_depend>
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

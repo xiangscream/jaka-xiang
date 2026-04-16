@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>jaka_a5</name>
+  <version>0.1.0</version>
+  <description>JAKA A5 Robot Integration Meta-Package</description>
+  <maintainer email="xiang@todo.todo">xiang</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>jaka_a5_gazebo</exec_depend>
+  <exec_depend>jaka_a5_control</exec_depend>
+  <exec_depend>jaka_a5_planning</exec_depend>
+  <exec_depend>jaka_a5_vision</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
