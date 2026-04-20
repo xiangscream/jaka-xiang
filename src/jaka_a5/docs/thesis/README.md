@@ -8,18 +8,27 @@
 
 ## 📋 目录
 
-1. [项目概述](#1-项目概述)
-2. [环境配置](#2-环境配置)
-3. [创建工作空间和包结构](#3-创建工作空间和包结构)
-4. [机器人描述（URDF/xacro）](#4-机器人描述urdfxacro)
-5. [Gazebo 仿真环境](#5-gazebo-仿真环境)
-6. [ros2_control 控制器配置](#6-ros2_control-控制器配置)
-7. [MoveIt2 运动规划](#7-moveit2-运动规划)
-8. [Eye-in-Hand 相机配置](#8-eye-in-hand-相机配置)
-9. [AprilTag 视觉检测](#9-apriltag-视觉检测)
-10. [视觉伺服控制器](#10-视觉伺服控制器)
-11. [系统集成与启动](#11-系统集成与启动)
-12. [常见问题排查](#12-常见问题排查)
+1. [README — 项目概述与快速导航](./README.md)
+2. [step-by-step-tutorial.md — 从零搭建项目的详细步骤](./step-by-step-tutorial.md)
+3. [knowledge-modules.md — 各模块知识整理](./knowledge-modules.md)
+4. [literature-review.md — 文献综述与技术调研](./literature-review.md)
+5. [paper-references.md — 论文推荐清单](./paper-references.md)
+
+---
+
+## 📚 文档分类
+
+### 教程类
+| 文档 | 内容 | 适合 |
+|------|------|------|
+| step-by-step-tutorial.md | 从环境配置到完整系统的10阶段搭建教程 | 跟着做 |
+| knowledge-modules.md | ROS2、机械臂、Gazebo、视觉伺服知识整理 | 学习理论 |
+
+### 论文类
+| 文档 | 内容 | 适合 |
+|------|------|------|
+| literature-review.md | 视觉伺服、Eye-in-Hand、AprilTag、深度学习综述 | 写文献综述 |
+| paper-references.md | 20+经典论文推荐清单，含引用格式 | 写参考文献 |
 
 ---
 
