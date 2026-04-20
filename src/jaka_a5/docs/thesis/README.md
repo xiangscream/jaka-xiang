@@ -13,6 +13,7 @@
 3. [knowledge-modules.md — 各模块知识整理](./knowledge-modules.md)
 4. [literature-review.md — 文献综述与技术调研](./literature-review.md)
 5. [paper-references.md — 论文推荐清单](./paper-references.md)
+6. [project-continuation-plan.md — 当前工程判断与续做计划](./project-continuation-plan.md)
 
 ---
 
