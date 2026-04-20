@@ -1,10 +1,9 @@
-apriltag_ros:
+apriltag:
   ros__parameters:
-    camera_name: camera
-    image_topic: /camera/image_raw
-    camera_info_topic: /camera/camera_info
     tag_family: 36h11
     tag_ids: [1]
     tag_size: 0.05
+    image_transport: raw
+    image_qos_profile: sensor_data
     publish_tf: true
     debug: false

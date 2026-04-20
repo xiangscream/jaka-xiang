@@ -1,6 +1,6 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, TimerAction
-from launch.substitutions import LaunchConfiguration
+from launch.actions import IncludeLaunchDescription, TimerAction, AppendEnvironmentVariable
+from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 import os
 import subprocess
@@ -11,6 +11,7 @@ def generate_launch_description():
     xacro_file = os.path.join(pkg_share, 'urdf', 'jaka_a5.urdf.xacro')
     world_share = get_package_share_directory('jaka_a5_gazebo')
     world_file = os.path.join(world_share, 'worlds', 'battery_station.world')
+    ros_gz_sim_share = get_package_share_directory('ros_gz_sim')
 
     # Process xacro to get URDF XML for robot_state_publisher
     result = subprocess.run(
@@ -21,39 +22,78 @@ def generate_launch_description():
     )
     robot_desc_xml = result.stdout
 
-    # Start Gazebo with the world file (with --wait for readiness)
-    gz_sim = ExecuteProcess(
-        cmd=['gz', 'sim', '-r', '--wait', world_file],
-        output='screen'
+    set_gz_resource_path_description = AppendEnvironmentVariable(
+        'GZ_SIM_RESOURCE_PATH',
+        os.path.abspath(os.path.join(pkg_share, '..'))
     )
 
-    # Robot state publisher (must start before spawn so TF is available)
+    set_gz_resource_path_worlds = AppendEnvironmentVariable(
+        'GZ_SIM_RESOURCE_PATH',
+        os.path.join(world_share, 'models')
+    )
+
+    set_gz_resource_path_package = AppendEnvironmentVariable(
+        'GZ_SIM_RESOURCE_PATH',
+        world_share
+    )
+
+    gazebo = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(ros_gz_sim_share, 'launch', 'gz_sim.launch.py')
+        ),
+        launch_arguments={'gz_args': f'-r {world_file}'}.items()
+    )
+
     robot_state_pub = Node(
         package='robot_state_publisher',
         executable='robot_state_publisher',
         name='robot_state_publisher',
-        parameters=[{'robot_description': robot_desc_xml}],
+        parameters=[
+            {'robot_description': robot_desc_xml},
+            {'use_sim_time': True},
+        ],
         output='screen'
     )
 
-    # Spawn robot via ros2 service call (delayed to ensure Gazebo is ready)
     spawn_robot = TimerAction(
         period=3.0,
         actions=[
-            ExecuteProcess(
-                cmd=[
-                    'bash', '-c',
-                    f'URDF=$(xacro {xacro_file}) && '
-                    'ros2 service call /spawn_entity ros_gz_sim/srv/SpawnEntity '
-                    '"{name: jaka_a5, xml: $URDF}"'
+            Node(
+                package='ros_gz_sim',
+                executable='create',
+                arguments=[
+                    '-name', 'jaka_a5',
+                    '-topic', 'robot_description',
                 ],
                 output='screen'
             )
         ]
     )
 
+    common_bridge = Node(
+        package='ros_gz_bridge',
+        executable='parameter_bridge',
+        arguments=[
+            '/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock',
+            '/camera/camera_info@sensor_msgs/msg/CameraInfo[gz.msgs.CameraInfo',
+        ],
+        output='screen'
+    )
+
+    camera_image_bridge = Node(
+        package='ros_gz_image',
+        executable='image_bridge',
+        arguments=['/camera/image_raw'],
+        output='screen'
+    )
+
     return LaunchDescription([
-        gz_sim,
+        set_gz_resource_path_description,
+        set_gz_resource_path_worlds,
+        set_gz_resource_path_package,
+        gazebo,
         robot_state_pub,
+        common_bridge,
+        camera_image_bridge,
         spawn_robot
     ])

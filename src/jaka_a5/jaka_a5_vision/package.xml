@@ -8,9 +8,13 @@
   <buildtool_depend>ament_python</buildtool_depend>
   <depend>rclpy</depend>
   <depend>geometry_msgs</depend>
+  <depend>sensor_msgs</depend>
   <depend>trajectory_msgs</depend>
   <depend>apriltag_msgs</depend>
   <depend>apriltag_ros</depend>
+  <depend>moveit_msgs</depend>
+  <depend>ros_gz_interfaces</depend>
+  <depend>tf2_ros</depend>
   <export>
     <build_type>ament_python</build_type>
   </export>

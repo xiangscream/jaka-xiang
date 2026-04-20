@@ -1,5 +1,4 @@
 <?xml version="1.0"?>
-<?xml-model href="http://www.ros.org/wiki/xacro" ?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro"
        name="jaka_a5">
 

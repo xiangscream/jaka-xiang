@@ -5,6 +5,8 @@
   <xacro:property name="PI" value="3.1415926535897931" />
   <xacro:property name="VELOCITY" value="3.665" />
 
+  <link name="world" />
+
   <!-- Base Link -->
   <link name="base_link">
     <inertial>
@@ -228,14 +230,100 @@
     <limit lower="-6.28" upper="6.28" effort="1000" velocity="3.665" />
   </joint>
 
-  <!-- Eye-in-Hand Camera Mount (fake link for camera) -->
-  <link name="camera_link" />
+  <!-- Eye-in-Hand Camera Mount -->
+  <link name="camera_link">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <mass value="0.08" />
+      <inertia ixx="1.8e-05" ixy="0.0" ixz="0.0" iyy="1.8e-05" iyz="0.0" izz="1.2e-05" />
+    </inertial>
+    <visual>
+      <origin xyz="0.0 0.0 0.0" rpy="0 0 0" />
+      <geometry>
+        <box size="0.045 0.03 0.03" />
+      </geometry>
+      <material name="camera_body">
+        <color rgba="0.1 0.1 0.1 1.0" />
+      </material>
+    </visual>
+    <visual>
+      <origin xyz="0.024 0.0 0.0" rpy="0 1.5708 0" />
+      <geometry>
+        <cylinder radius="0.009" length="0.01" />
+      </geometry>
+      <material name="camera_lens">
+        <color rgba="0.25 0.45 0.8 1.0" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0.0 0.0 0.0" rpy="0 0 0" />
+      <geometry>
+        <box size="0.045 0.03 0.03" />
+      </geometry>
+    </collision>
+  </link>
 
   <joint name="camera_joint" type="fixed">
-    <origin xyz="0 0 0.02" rpy="0 0 0" />
+    <origin xyz="0.055 0 0.045" rpy="0 0 0" />
     <parent link="J6" />
     <child link="camera_link" />
   </joint>
+
+  <link name="camera_optical_frame" />
+
+  <joint name="camera_optical_joint" type="fixed">
+    <origin xyz="0 0 0" rpy="-1.57079632679 0 -1.57079632679" />
+    <parent link="camera_link" />
+    <child link="camera_optical_frame" />
+  </joint>
+
+  <ros2_control name="GazeboSimSystem" type="system">
+    <hardware>
+      <plugin>gz_ros2_control/GazeboSimSystem</plugin>
+    </hardware>
+    <joint name="joint_1">
+      <command_interface name="position" />
+      <state_interface name="position">
+        <param name="initial_value">0.20943951023931953</param>
+      </state_interface>
+      <state_interface name="velocity" />
+    </joint>
+    <joint name="joint_2">
+      <command_interface name="position" />
+      <state_interface name="position">
+        <param name="initial_value">1.9198621771937625</param>
+      </state_interface>
+      <state_interface name="velocity" />
+    </joint>
+    <joint name="joint_3">
+      <command_interface name="position" />
+      <state_interface name="position">
+        <param name="initial_value">-2.181661564992912</param>
+      </state_interface>
+      <state_interface name="velocity" />
+    </joint>
+    <joint name="joint_4">
+      <command_interface name="position" />
+      <state_interface name="position">
+        <param name="initial_value">0.3141592653589793</param>
+      </state_interface>
+      <state_interface name="velocity" />
+    </joint>
+    <joint name="joint_5">
+      <command_interface name="position" />
+      <state_interface name="position">
+        <param name="initial_value">0.22689280275926285</param>
+      </state_interface>
+      <state_interface name="velocity" />
+    </joint>
+    <joint name="joint_6">
+      <command_interface name="position" />
+      <state_interface name="position">
+        <param name="initial_value">0.0</param>
+      </state_interface>
+      <state_interface name="velocity" />
+    </joint>
+  </ros2_control>
 
   <!-- ROS2 control transmission - repeat for all 6 joints -->
   <transmission name="trans_joint_1">

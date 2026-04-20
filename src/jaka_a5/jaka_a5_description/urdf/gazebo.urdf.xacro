@@ -1,16 +1,6 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
 
-  <!-- Gazebo ros2_control plugin -->
-  <xacro:macro name="gazebo_ros2_control" params="name">
-    <gazebo>
-      <plugin name="gazebo_ros2_control" filename="libgazebo_ros2_control.so">
-        <robotNamespace>/${name}</robotNamespace>
-        <robotParam>robot_description</robotParam>
-      </plugin>
-    </gazebo>
-  </xacro:macro>
-
   <!-- Apply gazebo materials to all links -->
   <gazebo reference="base_link">
     <material>Gazebo/DarkGrey</material>
@@ -35,6 +25,54 @@
   </gazebo>
 
   <!-- ros2_control plugin -->
-  <gazebo_ros2_control name="jaka_a5" />
+  <gazebo>
+    <plugin filename="gz_ros2_control-system" name="gz_ros2_control::GazeboSimROS2ControlPlugin">
+      <parameters>$(find jaka_a5_control)/config/ros2_controllers.yaml</parameters>
+      <ros>
+        <remapping>/controller_manager/robot_description:=/robot_description</remapping>
+      </ros>
+    </plugin>
+  </gazebo>
+
+  <!-- ============================================================
+       Eye-in-Hand Camera Sensor (Gazebo)
+       挂在 J6 末端，发布 /camera/image_raw + /camera/camera_info
+       ============================================================ -->
+  <gazebo reference="camera_link">
+    <sensor type="camera" name="camera_sensor">
+      <!-- 相机更新频率 Hz -->
+      <always_on>true</always_on>
+      <visualize>true</visualize>
+      <update_rate>15.0</update_rate>
+      <gz_frame_id>camera_optical_frame</gz_frame_id>
+      <!-- Place the sensor slightly in front of the housing to avoid self-occlusion. -->
+      <pose>0.028 0 0 0 0 0</pose>
+      <topic>/camera/image_raw</topic>
+      <camera>
+        <camera_info_topic>/camera/camera_info</camera_info_topic>
+        <!-- 水平视场角 ~60度 -->
+        <horizontal_fov>1.047</horizontal_fov>
+        <!-- 图像分辨率与格式 -->
+        <image>
+          <width>640</width>
+          <height>480</height>
+          <format>R8G8B8</format>
+        </image>
+        <!-- 裁剪平面（Near/Far Plane） -->
+        <clip>
+          <near>0.01</near>
+          <far>100</far>
+        </clip>
+        <!-- 畸变参数（默认无畸变） -->
+        <distortion>
+          <k1>0.0</k1>
+          <k2>0.0</k2>
+          <p1>0.0</p1>
+          <p2>0.0</p2>
+          <kc>0.0</kc>
+        </distortion>
+      </camera>
+    </sensor>
+  </gazebo>
 
 </robot>

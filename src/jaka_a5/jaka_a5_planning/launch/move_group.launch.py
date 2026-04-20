@@ -3,6 +3,7 @@ from launch_ros.actions import Node
 from ament_index_python.packages import get_package_share_directory
 import os
 import subprocess
+import yaml
 
 def generate_launch_description():
     pkg_share = get_package_share_directory('jaka_a5_planning')
@@ -21,24 +22,34 @@ def generate_launch_description():
         raise RuntimeError(f'xacro failed: {e.stderr}') from e
     robot_desc_xml = result.stdout
 
-    # Load joint limits
     joint_limits_file = os.path.join(pkg_share, 'config', 'joint_limits.yaml')
-
-    # Load OMPL config
     ompl_config_file = os.path.join(pkg_share, 'config', 'ompl_planning.yaml')
-
-    # Load kinematics
     kinematics_file = os.path.join(pkg_share, 'config', 'kinematics.yaml')
+    moveit_controllers_file = os.path.join(pkg_share, 'config', 'moveit_controllers.yaml')
+
+    with open(joint_limits_file, 'r') as f:
+        joint_limits = yaml.safe_load(f)
+
+    with open(ompl_config_file, 'r') as f:
+        ompl_config = yaml.safe_load(f)
+
+    with open(kinematics_file, 'r') as f:
+        kinematics = yaml.safe_load(f)
+
+    with open(moveit_controllers_file, 'r') as f:
+        moveit_controllers = yaml.safe_load(f)
 
     move_group_params = [
         {'robot_description': robot_desc_xml},
         {'robot_description_semantic': srdf_content},
-        {'robot_description_planning': joint_limits_file},
-        {'moveit_controllers_initial_pose': 'home'},
+        {'robot_description_planning': joint_limits},
+        {'robot_description_kinematics': kinematics},
         {'planning_pipelines': ['ompl']},
         {'default_planning_pipeline': 'ompl'},
-        {'ompl': ompl_config_file},
-        {'kinematics': kinematics_file},
+        ompl_config,
+        moveit_controllers,
+        {'moveit_manage_controllers': False},
+        {'use_sim_time': True},
     ]
 
     move_group_node = Node(

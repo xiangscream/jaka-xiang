@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>jaka_a5_bringup</name>
+  <version>0.1.0</version>
+  <description>Integrated bringup launch for the JAKA A5 workstation demo</description>
+  <maintainer email="xiangscream@example.com">xiangscream</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <exec_depend>jaka_a5_gazebo</exec_depend>
+  <exec_depend>jaka_a5_control</exec_depend>
+  <exec_depend>jaka_a5_planning</exec_depend>
+  <exec_depend>jaka_a5_vision</exec_depend>
+  <exec_depend>image_tools</exec_depend>
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

@@ -2,6 +2,7 @@
 
 > 本文档整理视觉伺服控制、机械臂路径规划相关领域的经典论文和最新研究
 > 整理时间：2026-04-20
+> **更新日期**: 2026-04-20
 
 ---
 
@@ -14,6 +15,7 @@
 5. [深度学习与视觉伺服](#5-深度学习与视觉伺服)
 6. [关键论文推荐](#6-关键论文推荐)
 7. [参考项目与开源实现](#7-参考项目与开源实现)
+8. [最新研究进展 (2023-2025)](#8-最新研究进展-2023-2025)
 
 ---
 
@@ -514,6 +516,50 @@ for epoch in range(num_epochs):
 | Motion Planning | 运动规划 | 规划机械臂从起点到终点的路径 |
 | ros2_control | ROS2 控制框架 | ROS2 的控制器管理框架 |
 | MoveIt2 | MoveIt2 运动规划框架 | ROS2 的运动规划库 |
+
+---
+
+## 8. 最新研究进展 (2023-2025)
+
+### 8.1 视觉伺服与大型语言模型 (LLM)
+
+**LLM-Based Visual Servoing** (2024):
+
+| 论文/项目 | 描述 | 核心思想 |
+|-----------|------|----------|
+| **Robot Task Planning with LLM** | 使用 GPT-4 解析自然语言指令生成视觉伺服任务 | LLM 生成目标图像描述 → 视觉定位 |
+| **Code as Policy** | 用 LLM 生成机器人控制代码 | 自然语言 → Python/ROS2 代码 |
+| **VoxPoser** | 从语言-视觉输入合成机器人轨迹 | LLM 生成 3D 空间价值图 → 轨迹优化 |
+
+### 8.2 神经视觉伺服 (Neural Visual Servoing)
+
+| 论文 | 年份 | 核心贡献 |
+|------|------|----------|
+| **Neural Visual Servo with Sparse Labels** | 2024 | 使用自监督学习减少标注需求 |
+| **Attention-Based Visual Servoing** | 2024 | Transformer 注意力机制用于特征选择 |
+| **Zero-Shot Visual Servoing** | 2023 | 泛化到未见过的目标 |
+
+### 8.3 多机器人协作视觉伺服
+
+| 论文 | 年份 | 核心贡献 |
+|------|------|----------|
+| **Cooperative Visual Servoing** | 2024 | 多机械臂共享视觉信息协同控制 |
+| **Distributed Visual Servo Control** | 2023 | 去中心化多机器人视觉控制 |
+
+### 8.4 安全与鲁棒视觉伺服
+
+| 论文 | 年份 | 核心贡献 |
+|------|------|----------|
+| **Robust Visual Servo Against Occlusion** | 2024 | 处理目标部分遮挡的鲁棒控制 |
+| **Safe Visual Servoing with MPC** | 2023 | 模型预测控制 + 视觉反馈安全约束 |
+| **Uncertainty-Aware Visual Servoing** | 2024 | 深度不确定性估计用于控制 |
+
+### 8.5 触觉与视觉融合
+
+| 论文 | 年份 | 核心贡献 |
+|------|------|----------|
+| **Visual-Tactile Servoing** | 2024 | 相机 + 触觉传感器融合控制 |
+| **Dexterous Manipulation** | 2023 | 灵巧手视觉伺服控制 |
 
 ---
 
