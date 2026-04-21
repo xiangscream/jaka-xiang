@@ -21,6 +21,7 @@ setup(
             'camera_qos_relay = jaka_a5_vision.camera_qos_relay:main',
             'apriltag_subscriber = jaka_a5_vision.apriltag_subscriber:main',
             'vs_controller = jaka_a5_vision.vs_controller:main',
+            'pregrasp_coordinator = jaka_a5_vision.pregrasp_coordinator:main',
         ],
     },
 )

@@ -1,9 +1,12 @@
 apriltag:
   ros__parameters:
-    tag_family: 36h11
-    tag_ids: [1]
-    tag_size: 0.05
+    family: 36h11
+    size: 0.05
     image_transport: raw
-    image_qos_profile: sensor_data
     publish_tf: true
     debug: false
+    pose_estimation_method: pnp
+    tag:
+      ids: [1]
+      frames: ['tag36h11:1']
+      sizes: [0.05]

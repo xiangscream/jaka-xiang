@@ -11,6 +11,8 @@ def generate_launch_description():
     apriltag_config = os.path.join(pkg_share, 'config', 'apriltag.yaml')
 
     enable_servo_controller = LaunchConfiguration('enable_servo_controller')
+    enable_moveit_coordinator = LaunchConfiguration('enable_moveit_coordinator')
+    servo_enable_topic = '/visual_servo/enable'
 
     camera_qos_relay = Node(
         package='jaka_a5_vision',
@@ -45,8 +47,17 @@ def generate_launch_description():
         package='jaka_a5_vision',
         executable='vs_controller',
         name='visual_servo_controller',
-        parameters=[{'use_sim_time': True}],
+        parameters=[{'use_sim_time': True, 'servo_enable_topic': servo_enable_topic}],
         condition=IfCondition(enable_servo_controller),
+        output='screen'
+    )
+
+    moveit_coordinator = Node(
+        package='jaka_a5_vision',
+        executable='pregrasp_coordinator',
+        name='pregrasp_coordinator',
+        parameters=[{'use_sim_time': True, 'servo_enable_topic': servo_enable_topic}],
+        condition=IfCondition(enable_moveit_coordinator),
         output='screen'
     )
 
@@ -56,8 +67,14 @@ def generate_launch_description():
             default_value='false',
             description='Start the automatic visual servo controller'
         ),
+        DeclareLaunchArgument(
+            'enable_moveit_coordinator',
+            default_value='false',
+            description='Use MoveIt to reach pre_grasp before enabling visual servo'
+        ),
         camera_qos_relay,
         apriltag,
         apriltag_sub,
         vs_controller,
+        moveit_coordinator,
     ])

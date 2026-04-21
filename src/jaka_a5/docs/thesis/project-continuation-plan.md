@@ -1,6 +1,6 @@
 # JAKA A5 Project Continuation Plan
 
-Last updated: 2026-04-20
+Last updated: 2026-04-21
 
 Purpose:
 - Record the current engineering judgment and next execution steps so future work can resume directly from the repository state.
@@ -20,6 +20,34 @@ Purpose:
   - task-frame semantics
   - MoveIt coarse positioning vs visual-servo fine alignment
   - experiment logging and thesis/code consistency
+
+## Progress Update
+
+- Priority 1 is partially implemented in the repository code.
+- `apriltag_subscriber.py` now publishes semantic observation topics:
+  - `/tag_pose_camera`
+  - `/tag_pose_world`
+  - `/battery_center`
+- Backward compatibility is preserved through `/target_pose`.
+- `vs_controller.py` now publishes inspectable task-goal topics:
+  - `/task_frames/pre_grasp`
+  - `/task_frames/grasp_target`
+  - `/task_frames/place_target`
+- The controller now defaults to consuming `/tag_pose_camera` instead of the ambiguous `/target_pose`.
+- Remaining Priority 1 work is runtime validation in RViz and TF inspection, not basic code plumbing.
+- Priority 2 is partially implemented with a minimal staged workflow:
+  - `pregrasp_coordinator.py` subscribes to `/task_frames/pre_grasp`
+  - the coordinator sends a MoveIt `MoveGroup` goal for coarse positioning
+  - after successful coarse positioning, it publishes `/visual_servo/enable`
+  - `vs_controller.py` can now wait for that external enable signal before starting fine alignment
+- Fine alignment semantics are now explicit:
+  - `ALIGN` means "keep the tag centered while moving to the final grasp pose"
+  - when the tag is centered and the camera-to-tag distance reaches 3 cm, the controller transitions directly to `GRASP`
+  - `GRASP -> LIFT -> TRANSFER -> PLACE -> RETREAT` continues the battery-swap task state machine
+- The staged launch path is now available through:
+  - `integration.launch.py`
+  - `vs.launch.py`
+  - launch argument: `enable_moveit_coordinator:=true`
 
 ## Scope Freeze
 
@@ -41,16 +69,61 @@ The project should be finished under these explicit assumptions:
 - `apriltag_ros` provides tag detection and TF.
 - `apriltag_subscriber.py` currently converts tag TF into `/target_pose`.
 - `vs_controller.py` contains the main task state machine:
-  - `SEARCH`
-  - `ALIGN`
-  - `APPROACH`
-  - `GRASP`
-  - `LIFT`
-  - `TRANSFER`
-  - `PLACE`
-  - `RETREAT`
-  - `DONE`
+  - `S0_STANDBY`
+  - `S1_SIDE_APPROACH`
+  - `S2_ALIGN`
+  - `S3_CLAMP`
+  - `S4_EXTRACT`
+  - `S5_SAFE_EXIT`
+  - `S6_PLACE_OLD_BATTERY`
+  - `S7_TOOL_RESET`
+  - `S8_GRASP_NEW_BATTERY`
+  - `S9_MOVE_TO_DOCK`
+  - `S10_INSERT_NEW_BATTERY`
+  - `S11_RESET`
 - `integration.launch.py` brings up Gazebo, ros2_control, MoveIt, and vision.
+
+## State Machine Configuration Guidance
+
+- Design the state machine from the real battery-swap procedure first, not from existing variable names.
+- Target workflow should now be treated as this 12-state loop:
+  - `S0` standby
+  - `S1` side approach (coarse positioning)
+  - `S2` alignment (fine positioning)
+  - `S3` clamp old battery
+  - `S4` extract old battery
+  - `S5` safe exit
+  - `S6` place old battery
+  - `S7` end-effector reset
+  - `S8` grasp new battery
+  - `S9` move to docking pose
+  - `S10` insert new battery
+  - `S11` reset
+  - then return to `S0`
+- For each state, define explicitly:
+  - target pose or path
+  - reference frame
+  - transition condition
+  - failure/timeout condition
+- Recommended path split for this workflow:
+  - `S1`, `S6`, `S8`, `S9`, `S11`: MoveIt waypoint / coarse motion states
+  - `S2`: vision-servo fine alignment state
+  - `S4`, `S5`, `S10`: process-axis linear motion states
+  - `S3`: clamp/attach execution state
+- Current fine-alignment rule remains:
+  - `S2` should keep the tag centered while converging to the final grasp pose
+  - when the tag is centered and camera-to-tag distance reaches 3 cm, transition to clamp/grasp
+- Recommended real-process pose/offset set to define explicitly:
+  - `approach_pose_old_battery`
+  - `extract_distance`, `extract_axis`
+  - `safe_exit_pose`
+  - `old_battery_drop_pose`
+  - `reset_pose_after_old_battery`
+  - `new_battery_pick_pose`
+  - `dock_pose`
+  - `insert_distance`, `insert_axis`
+  - `home_pose` or `standby_pose`
+- The current code now uses a 12-state skeleton in `vs_controller.py`, but later task states are still implemented with task-level simulation offsets rather than full real-process geometry and dual-battery world modeling.
 
 ## Most Important Remaining Problems
 

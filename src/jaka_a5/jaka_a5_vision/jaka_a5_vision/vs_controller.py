@@ -6,9 +6,11 @@ import rclpy
 from geometry_msgs.msg import Pose, PoseStamped, Quaternion
 from moveit_msgs.srv import GetPositionIK
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from ros_gz_interfaces.msg import Entity
 from ros_gz_interfaces.srv import SetEntityPose
 from sensor_msgs.msg import JointState
+from std_msgs.msg import Bool
 from tf2_ros import Buffer, TransformException, TransformListener
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
@@ -17,15 +19,18 @@ TransformData = Tuple[List[List[float]], List[float]]
 
 
 class ServoState(str, Enum):
-    SEARCH = 'search'
-    ALIGN = 'align'
-    APPROACH = 'approach'
-    GRASP = 'grasp'
-    LIFT = 'lift'
-    TRANSFER = 'transfer'
-    PLACE = 'place'
-    RETREAT = 'retreat'
-    DONE = 'done'
+    S0_STANDBY = 's0_standby'
+    S1_SIDE_APPROACH = 's1_side_approach'
+    S2_ALIGN = 's2_align'
+    S3_CLAMP = 's3_clamp'
+    S4_EXTRACT = 's4_extract'
+    S5_SAFE_EXIT = 's5_safe_exit'
+    S6_PLACE_OLD_BATTERY = 's6_place_old_battery'
+    S7_TOOL_RESET = 's7_tool_reset'
+    S8_GRASP_NEW_BATTERY = 's8_grasp_new_battery'
+    S9_MOVE_TO_DOCK = 's9_move_to_dock'
+    S10_INSERT_NEW_BATTERY = 's10_insert_new_battery'
+    S11_RESET = 's11_reset'
 
 
 def clamp(value: float, limit: float) -> float:
@@ -185,7 +190,9 @@ class VisualServoController(Node):
         super().__init__('visual_servo_controller')
 
         self.declare_parameter('joint_names', ['joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5', 'joint_6'])
-        self.declare_parameter('target_topic', '/target_pose')
+        self.declare_parameter('target_topic', '/tag_pose_camera')
+        self.declare_parameter('tag_pose_world_topic', '/tag_pose_world')
+        self.declare_parameter('battery_center_topic', '/battery_center')
         self.declare_parameter('joint_state_topic', '/joint_states')
         self.declare_parameter('command_topic', '/jaka_a5_arm_controller/joint_trajectory')
         self.declare_parameter('ik_service', '/compute_ik')
@@ -195,10 +202,12 @@ class VisualServoController(Node):
         self.declare_parameter('camera_frame', 'camera_optical_frame')
         self.declare_parameter('group_name', 'manipulator')
         self.declare_parameter('battery_model_name', 'battery_with_tag')
-        self.declare_parameter('hover_distance', 0.20)
-        self.declare_parameter('grasp_distance', 0.12)
+        self.declare_parameter('hover_distance', 0.16)
+        self.declare_parameter('grasp_distance', 0.03)
         self.declare_parameter('xy_tolerance', 0.012)
         self.declare_parameter('z_tolerance', 0.015)
+        self.declare_parameter('align_loss_grace_cycles', 5)
+        self.declare_parameter('search_observation_joints', [0.20, 1.82, -2.08, 0.31, 0.22, 0.0])
         self.declare_parameter('xy_gain', 0.7)
         self.declare_parameter('z_gain', 0.6)
         self.declare_parameter('max_servo_step', 0.025)
@@ -206,16 +215,26 @@ class VisualServoController(Node):
         self.declare_parameter('joint_tolerance', 0.04)
         self.declare_parameter('command_timeout', 2.5)
         self.declare_parameter('target_timeout', 1.0)
-        self.declare_parameter('lift_height', 0.10)
-        self.declare_parameter('transfer_y_offset', -0.22)
-        self.declare_parameter('place_drop', 0.08)
-        self.declare_parameter('retreat_height', 0.10)
+        self.declare_parameter('extract_offset', [0.0, 0.0, 0.10])
+        self.declare_parameter('safe_exit_offset', [0.0, -0.18, 0.10])
+        self.declare_parameter('old_battery_place_offset', [0.0, -0.22, 0.02])
+        self.declare_parameter('tool_reset_offset', [0.0, 0.0, 0.12])
+        self.declare_parameter('new_battery_pick_offset', [0.0, 0.22, -0.02])
+        self.declare_parameter('dock_offset', [0.0, -0.22, 0.0])
+        self.declare_parameter('insert_offset', [0.0, 0.0, -0.08])
+        self.declare_parameter('final_reset_offset', [0.0, 0.0, 0.12])
         self.declare_parameter('path_step', 0.03)
         self.declare_parameter('path_tolerance', 0.015)
         self.declare_parameter('tag_to_battery_center', 0.011)
+        self.declare_parameter('pre_grasp_topic', '/task_frames/pre_grasp')
+        self.declare_parameter('grasp_target_topic', '/task_frames/grasp_target')
+        self.declare_parameter('place_target_topic', '/task_frames/place_target')
+        self.declare_parameter('servo_enable_topic', '')
 
         self.joint_names = list(self.get_parameter('joint_names').value)
         self.target_topic = self.get_parameter('target_topic').value
+        self.tag_pose_world_topic = self.get_parameter('tag_pose_world_topic').value
+        self.battery_center_topic = self.get_parameter('battery_center_topic').value
         self.joint_state_topic = self.get_parameter('joint_state_topic').value
         self.command_topic = self.get_parameter('command_topic').value
         self.ik_service_name = self.get_parameter('ik_service').value
@@ -229,6 +248,8 @@ class VisualServoController(Node):
         self.grasp_distance = float(self.get_parameter('grasp_distance').value)
         self.xy_tolerance = float(self.get_parameter('xy_tolerance').value)
         self.z_tolerance = float(self.get_parameter('z_tolerance').value)
+        self.align_loss_grace_cycles = max(1, int(self.get_parameter('align_loss_grace_cycles').value))
+        self.search_observation_joints = [float(value) for value in self.get_parameter('search_observation_joints').value]
         self.xy_gain = float(self.get_parameter('xy_gain').value)
         self.z_gain = float(self.get_parameter('z_gain').value)
         self.max_servo_step = float(self.get_parameter('max_servo_step').value)
@@ -236,18 +257,29 @@ class VisualServoController(Node):
         self.joint_tolerance = float(self.get_parameter('joint_tolerance').value)
         self.command_timeout = float(self.get_parameter('command_timeout').value)
         self.target_timeout = float(self.get_parameter('target_timeout').value)
-        self.lift_height = float(self.get_parameter('lift_height').value)
-        self.transfer_y_offset = float(self.get_parameter('transfer_y_offset').value)
-        self.place_drop = float(self.get_parameter('place_drop').value)
-        self.retreat_height = float(self.get_parameter('retreat_height').value)
+        self.extract_offset = [float(value) for value in self.get_parameter('extract_offset').value]
+        self.safe_exit_offset = [float(value) for value in self.get_parameter('safe_exit_offset').value]
+        self.old_battery_place_offset = [float(value) for value in self.get_parameter('old_battery_place_offset').value]
+        self.tool_reset_offset = [float(value) for value in self.get_parameter('tool_reset_offset').value]
+        self.new_battery_pick_offset = [float(value) for value in self.get_parameter('new_battery_pick_offset').value]
+        self.dock_offset = [float(value) for value in self.get_parameter('dock_offset').value]
+        self.insert_offset = [float(value) for value in self.get_parameter('insert_offset').value]
+        self.final_reset_offset = [float(value) for value in self.get_parameter('final_reset_offset').value]
         self.path_step = float(self.get_parameter('path_step').value)
         self.path_tolerance = float(self.get_parameter('path_tolerance').value)
         self.tag_to_battery_center = float(self.get_parameter('tag_to_battery_center').value)
+        self.pre_grasp_topic = self.get_parameter('pre_grasp_topic').value
+        self.grasp_target_topic = self.get_parameter('grasp_target_topic').value
+        self.place_target_topic = self.get_parameter('place_target_topic').value
+        self.servo_enable_topic = str(self.get_parameter('servo_enable_topic').value)
 
-        self.state = ServoState.SEARCH
+        self.state = ServoState.S0_STANDBY
         self.current_joint_state: Dict[str, float] = {}
         self.last_target_pose: Optional[PoseStamped] = None
         self.last_target_received_time = None
+        self.last_target_stamp = None
+        self.last_tag_pose_world: Optional[PoseStamped] = None
+        self.last_battery_center_pose: Optional[PoseStamped] = None
         self.commanded_joint_positions: Optional[List[float]] = None
         self.last_command_time = None
         self.awaiting_motion = False
@@ -259,13 +291,34 @@ class VisualServoController(Node):
         self.last_requested_state: Optional[ServoState] = None
         self.service_warning_emitted = False
         self.attach_service_warning_emitted = False
+        self.servo_enabled = not self.servo_enable_topic
+        self.servo_gate_logged = False
+        self.task_cycle_complete = False
+        self.search_pose_commanded = False
+        self.align_target_missing_cycles = 0
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self.trajectory_pub = self.create_publisher(JointTrajectory, self.command_topic, 10)
+        self.pre_grasp_pub = self.create_publisher(PoseStamped, self.pre_grasp_topic, 10)
+        self.grasp_target_pub = self.create_publisher(PoseStamped, self.grasp_target_topic, 10)
+        self.place_target_pub = self.create_publisher(PoseStamped, self.place_target_topic, 10)
         self.target_sub = self.create_subscription(PoseStamped, self.target_topic, self.target_callback, 10)
+        self.tag_pose_world_sub = self.create_subscription(PoseStamped, self.tag_pose_world_topic, self.tag_pose_world_callback, 10)
+        self.battery_center_sub = self.create_subscription(PoseStamped, self.battery_center_topic, self.battery_center_callback, 10)
         self.joint_state_sub = self.create_subscription(JointState, self.joint_state_topic, self.joint_state_callback, 20)
+        self.servo_enable_sub = None
+        if self.servo_enable_topic:
+            servo_enable_qos = QoSProfile(depth=1)
+            servo_enable_qos.reliability = ReliabilityPolicy.RELIABLE
+            servo_enable_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+            self.servo_enable_sub = self.create_subscription(
+                Bool,
+                self.servo_enable_topic,
+                self.servo_enable_callback,
+                servo_enable_qos,
+            )
 
         self.ik_client = self.create_client(GetPositionIK, self.ik_service_name)
         self.set_entity_pose_client = self.create_client(SetEntityPose, self.set_entity_pose_service_name)
@@ -276,6 +329,19 @@ class VisualServoController(Node):
     def target_callback(self, msg: PoseStamped) -> None:
         self.last_target_pose = msg
         self.last_target_received_time = self.get_clock().now()
+        self.last_target_stamp = rclpy.time.Time.from_msg(msg.header.stamp)
+
+    def tag_pose_world_callback(self, msg: PoseStamped) -> None:
+        self.last_tag_pose_world = msg
+
+    def battery_center_callback(self, msg: PoseStamped) -> None:
+        self.last_battery_center_pose = msg
+
+    def servo_enable_callback(self, msg: Bool) -> None:
+        self.servo_enabled = msg.data
+        self.servo_gate_logged = False
+        if not self.servo_enabled:
+            self.task_cycle_complete = False
 
     def joint_state_callback(self, msg: JointState) -> None:
         for name, position in zip(msg.name, msg.position):
@@ -283,6 +349,22 @@ class VisualServoController(Node):
 
     def control_loop(self) -> None:
         self._update_attached_battery_pose()
+        self._publish_task_frames()
+
+        if self.state == ServoState.S0_STANDBY and not self.task_cycle_complete and self._has_fresh_target():
+            self._set_state(
+                ServoState.S1_SIDE_APPROACH,
+                'Task trigger received, waiting for coarse side-approach completion',
+            )
+
+        if self.state == ServoState.S0_STANDBY and not self._has_fresh_target():
+            self._hold_search_observation_pose()
+
+        if not self.servo_enabled:
+            if not self.servo_gate_logged:
+                self.get_logger().info('Visual servo is waiting for external enable signal')
+                self.servo_gate_logged = True
+            return
 
         if not self._joint_state_ready():
             return
@@ -301,68 +383,100 @@ class VisualServoController(Node):
             else:
                 return
 
-        if self.state == ServoState.SEARCH:
+        if self.state == ServoState.S0_STANDBY:
+            return
+
+        if self.state == ServoState.S1_SIDE_APPROACH:
             if self._has_fresh_target():
-                self._set_state(ServoState.ALIGN, 'AprilTag acquired, start closed-loop alignment')
+                self._set_state(
+                    ServoState.S2_ALIGN,
+                    'Coarse side approach complete, start fine alignment to centered 3 cm grasp pose',
+                )
             return
 
-        if self.state == ServoState.ALIGN:
+        if self.state == ServoState.S2_ALIGN:
             if not self._has_fresh_target():
-                self._set_state(ServoState.SEARCH, 'AprilTag lost during alignment')
+                self.align_target_missing_cycles += 1
+                if self.align_target_missing_cycles < self.align_loss_grace_cycles:
+                    return
+                self._set_state(ServoState.S1_SIDE_APPROACH, 'AprilTag lost during fine alignment')
                 return
-
-            if self._servo_to_tag(self.hover_distance):
-                self._set_state(ServoState.APPROACH, 'Hover pose reached, start vertical approach')
-            return
-
-        if self.state == ServoState.APPROACH:
-            if not self._has_fresh_target():
-                self._set_state(ServoState.SEARCH, 'AprilTag lost during final approach')
-                return
+            self.align_target_missing_cycles = 0
 
             if self._servo_to_tag(self.grasp_distance):
-                self._set_state(ServoState.GRASP, 'Grasp pose reached')
+                self._set_state(
+                    ServoState.S3_CLAMP,
+                    'AprilTag centered and grasp distance reached, clamp old battery',
+                )
             return
 
-        if self.state == ServoState.GRASP:
+        if self.state == ServoState.S3_CLAMP:
             if self._attach_battery_to_tool():
                 self.path_anchor = self._lookup_frame_transform(self.tool_frame)
-                self._set_state(ServoState.LIFT, 'Battery attached in simulation, start lift')
+                self._set_state(ServoState.S4_EXTRACT, 'Old battery clamped, start extraction')
             return
 
-        if self.state == ServoState.LIFT:
-            if self._drive_tool_from_anchor([0.0, 0.0, self.lift_height]):
+        if self.state == ServoState.S4_EXTRACT:
+            if self._drive_tool_from_anchor(self.extract_offset):
                 self.path_anchor = self._lookup_frame_transform(self.tool_frame)
-                self._set_state(ServoState.TRANSFER, 'Lift complete, start transfer path')
+                self._set_state(ServoState.S5_SAFE_EXIT, 'Old battery extracted, move to safe exit pose')
             return
 
-        if self.state == ServoState.TRANSFER:
-            if self._drive_tool_from_anchor([0.0, self.transfer_y_offset, 0.0]):
+        if self.state == ServoState.S5_SAFE_EXIT:
+            if self._drive_tool_from_anchor(self.safe_exit_offset):
                 self.path_anchor = self._lookup_frame_transform(self.tool_frame)
-                self._set_state(ServoState.PLACE, 'Transfer complete, start placement descent')
+                self._set_state(ServoState.S6_PLACE_OLD_BATTERY, 'Safe exit reached, place old battery')
             return
 
-        if self.state == ServoState.PLACE:
-            if self._drive_tool_from_anchor([0.0, 0.0, -self.place_drop]):
+        if self.state == ServoState.S6_PLACE_OLD_BATTERY:
+            if self._drive_tool_from_anchor(self.old_battery_place_offset):
                 self._release_battery()
                 self.path_anchor = self._lookup_frame_transform(self.tool_frame)
-                self._set_state(ServoState.RETREAT, 'Battery released, retreating upward')
+                self._set_state(ServoState.S7_TOOL_RESET, 'Old battery placed, reset tool')
             return
 
-        if self.state == ServoState.RETREAT:
-            if self._drive_tool_from_anchor([0.0, 0.0, self.retreat_height]):
-                self._set_state(ServoState.DONE, 'Closed-loop grasp and transfer sequence complete')
+        if self.state == ServoState.S7_TOOL_RESET:
+            if self._drive_tool_from_anchor(self.tool_reset_offset):
+                self.path_anchor = self._lookup_frame_transform(self.tool_frame)
+                self._set_state(ServoState.S8_GRASP_NEW_BATTERY, 'Tool reset complete, move to grasp new battery')
+            return
+
+        if self.state == ServoState.S8_GRASP_NEW_BATTERY:
+            if self._drive_tool_from_anchor(self.new_battery_pick_offset):
+                if self._attach_battery_from_current_tool():
+                    self.path_anchor = self._lookup_frame_transform(self.tool_frame)
+                    self._set_state(ServoState.S9_MOVE_TO_DOCK, 'New battery grasped in task-level simulation, move to dock')
+            return
+
+        if self.state == ServoState.S9_MOVE_TO_DOCK:
+            if self._drive_tool_from_anchor(self.dock_offset):
+                self.path_anchor = self._lookup_frame_transform(self.tool_frame)
+                self._set_state(ServoState.S10_INSERT_NEW_BATTERY, 'Dock pose reached, insert new battery')
+            return
+
+        if self.state == ServoState.S10_INSERT_NEW_BATTERY:
+            if self._drive_tool_from_anchor(self.insert_offset):
+                self._release_battery()
+                self.path_anchor = self._lookup_frame_transform(self.tool_frame)
+                self._set_state(ServoState.S11_RESET, 'Insertion complete, reset manipulator')
+            return
+
+        if self.state == ServoState.S11_RESET:
+            if self._drive_tool_from_anchor(self.final_reset_offset):
+                self.task_cycle_complete = True
+                self._set_state(ServoState.S0_STANDBY, 'Battery-swap cycle complete, return to standby')
             return
 
     def _joint_state_ready(self) -> bool:
         return all(name in self.current_joint_state for name in self.joint_names)
 
     def _has_fresh_target(self) -> bool:
-        if self.last_target_pose is None or self.last_target_received_time is None:
+        if self.last_target_pose is None or self.last_target_received_time is None or self.last_target_stamp is None:
             return False
 
-        age = (self.get_clock().now() - self.last_target_received_time).nanoseconds / 1e9
-        return age <= self.target_timeout
+        receive_age = (self.get_clock().now() - self.last_target_received_time).nanoseconds / 1e9
+        stamp_age = (self.get_clock().now() - self.last_target_stamp).nanoseconds / 1e9
+        return receive_age <= self.target_timeout and stamp_age <= self.target_timeout
 
     def _command_timed_out(self) -> bool:
         if self.last_command_time is None:
@@ -387,6 +501,35 @@ class VisualServoController(Node):
             return None
         return [self.current_joint_state[name] for name in self.joint_names]
 
+    def _hold_search_observation_pose(self) -> None:
+        if not self._joint_state_ready() or self.awaiting_motion or self.pending_ik_future is not None:
+            return
+
+        current = self._joint_position_vector()
+        if current is None:
+            return
+
+        if len(self.search_observation_joints) != len(self.joint_names):
+            if not self.service_warning_emitted:
+                self.get_logger().warn('search_observation_joints length does not match manipulator joint count')
+                self.service_warning_emitted = True
+            return
+
+        max_error = max(
+            abs(current[index] - self.search_observation_joints[index])
+            for index in range(len(self.joint_names))
+        )
+        if max_error < self.joint_tolerance:
+            self.search_pose_commanded = True
+            return
+
+        if self.search_pose_commanded:
+            return
+
+        self.get_logger().info('Moving to fixed search observation pose for AprilTag acquisition')
+        self._publish_trajectory(self.search_observation_joints)
+        self.search_pose_commanded = True
+
     def _lookup_frame_transform(self, frame_name: str) -> Optional[TransformData]:
         try:
             transform = self.tf_buffer.lookup_transform(
@@ -408,21 +551,28 @@ class VisualServoController(Node):
         return transform_from_pose(pose)
 
     def _servo_to_tag(self, desired_distance: float) -> bool:
-        if self.last_target_pose is None:
+        desired_tool = self._compute_servo_goal_transform(desired_distance)
+        if desired_tool is None:
             return False
-
-        world_tool = self._lookup_frame_transform(self.tool_frame)
-        world_camera = self._lookup_frame_transform(self.camera_frame)
-        if world_tool is None or world_camera is None:
-            return False
-
         tag = self.last_target_pose.pose.position
         lateral_error = math.hypot(tag.x, tag.y)
         distance_error = tag.z - desired_distance
 
         if lateral_error < self.xy_tolerance and abs(distance_error) < self.z_tolerance:
             return True
+        return self._request_ik_for_transform(desired_tool)
 
+    def _compute_servo_goal_transform(self, desired_distance: float) -> Optional[TransformData]:
+        if self.last_target_pose is None:
+            return None
+
+        world_tool = self._lookup_frame_transform(self.tool_frame)
+        world_camera = self._lookup_frame_transform(self.camera_frame)
+        if world_tool is None or world_camera is None:
+            return None
+
+        tag = self.last_target_pose.pose.position
+        distance_error = tag.z - desired_distance
         camera_delta = [
             clamp(tag.x * self.xy_gain, self.max_servo_step),
             clamp(tag.y * self.xy_gain, self.max_servo_step),
@@ -433,8 +583,29 @@ class VisualServoController(Node):
         world_delta = apply_rotation(world_camera_rotation, camera_delta)
         desired_camera = offset_transform(world_camera, world_delta)
         tool_to_camera = compose_transforms(invert_transform(world_tool), world_camera)
-        desired_tool = compose_transforms(desired_camera, invert_transform(tool_to_camera))
-        return self._request_ik_for_transform(desired_tool)
+        return compose_transforms(desired_camera, invert_transform(tool_to_camera))
+
+    def _compute_task_goal_transform(self, desired_distance: float) -> Optional[TransformData]:
+        if self.last_target_pose is None:
+            return None
+
+        world_tool = self._lookup_frame_transform(self.tool_frame)
+        world_camera = self._lookup_frame_transform(self.camera_frame)
+        if world_tool is None or world_camera is None:
+            return None
+
+        current_camera_to_tag = transform_from_pose(self.last_target_pose.pose)
+        desired_camera_to_tag_pose = Pose()
+        desired_camera_to_tag_pose.position.x = 0.0
+        desired_camera_to_tag_pose.position.y = 0.0
+        desired_camera_to_tag_pose.position.z = desired_distance
+        desired_camera_to_tag_pose.orientation = self.last_target_pose.pose.orientation
+        desired_camera_to_tag = transform_from_pose(desired_camera_to_tag_pose)
+
+        world_tag = compose_transforms(world_camera, current_camera_to_tag)
+        desired_camera = compose_transforms(world_tag, invert_transform(desired_camera_to_tag))
+        tool_to_camera = compose_transforms(invert_transform(world_tool), world_camera)
+        return compose_transforms(desired_camera, invert_transform(tool_to_camera))
 
     def _drive_tool_from_anchor(self, offset_world: List[float]) -> bool:
         if self.path_anchor is None:
@@ -554,6 +725,17 @@ class VisualServoController(Node):
         self.battery_attached = False
         self.tool_to_battery_transform = None
 
+    def _attach_battery_from_current_tool(self) -> bool:
+        world_tool = self._lookup_frame_transform(self.tool_frame)
+        if world_tool is None:
+            return False
+
+        world_battery = offset_along_local_axes(world_tool, [0.0, 0.0, -0.06])
+        self.tool_to_battery_transform = compose_transforms(invert_transform(world_tool), world_battery)
+        self.battery_attached = True
+        self._request_battery_pose_update()
+        return True
+
     def _update_attached_battery_pose(self) -> None:
         if not self.battery_attached or self.tool_to_battery_transform is None:
             return
@@ -600,13 +782,62 @@ class VisualServoController(Node):
             return
 
         self.state = new_state
+        self.align_target_missing_cycles = 0
         self.awaiting_motion = False
         self.commanded_joint_positions = None
         self.last_command_time = None
         self.pending_ik_future = None
-        if new_state in {ServoState.ALIGN, ServoState.APPROACH}:
+        if new_state in {ServoState.S1_SIDE_APPROACH, ServoState.S2_ALIGN, ServoState.S0_STANDBY}:
             self.path_anchor = None
+        if new_state == ServoState.S0_STANDBY:
+            self.search_pose_commanded = False
         self.get_logger().info(f'State -> {new_state.value}: {reason}')
+
+    def _publish_task_frames(self) -> None:
+        pre_grasp = self._make_pose_stamped(self._compute_task_goal_transform(self.hover_distance))
+        if pre_grasp is not None:
+            self.pre_grasp_pub.publish(pre_grasp)
+
+        grasp_target = self._make_pose_stamped(self._compute_task_goal_transform(self.grasp_distance))
+        if grasp_target is not None:
+            self.grasp_target_pub.publish(grasp_target)
+
+        place_target = self._compute_place_target_pose()
+        if place_target is not None:
+            self.place_target_pub.publish(place_target)
+
+    def _compute_place_target_pose(self) -> Optional[PoseStamped]:
+        task_state_offsets = {
+            ServoState.S4_EXTRACT: self.extract_offset,
+            ServoState.S5_SAFE_EXIT: self.safe_exit_offset,
+            ServoState.S6_PLACE_OLD_BATTERY: self.old_battery_place_offset,
+            ServoState.S7_TOOL_RESET: self.tool_reset_offset,
+            ServoState.S8_GRASP_NEW_BATTERY: self.new_battery_pick_offset,
+            ServoState.S9_MOVE_TO_DOCK: self.dock_offset,
+            ServoState.S10_INSERT_NEW_BATTERY: self.insert_offset,
+            ServoState.S11_RESET: self.final_reset_offset,
+        }
+        if self.path_anchor is not None and self.state in task_state_offsets:
+            target_transform = offset_transform(self.path_anchor, task_state_offsets[self.state])
+            return self._make_pose_stamped(target_transform)
+
+        if self.last_battery_center_pose is None:
+            return None
+
+        pose = PoseStamped()
+        pose.header = self.last_battery_center_pose.header
+        pose.pose = self.last_battery_center_pose.pose
+        pose.pose.position.y += self.old_battery_place_offset[1]
+        return pose
+
+    def _make_pose_stamped(self, transform: Optional[TransformData]) -> Optional[PoseStamped]:
+        if transform is None:
+            return None
+        pose = PoseStamped()
+        pose.header.frame_id = self.world_frame
+        pose.header.stamp = self.get_clock().now().to_msg()
+        pose.pose = pose_from_transform(transform)
+        return pose
 
 
 def main(args=None) -> None:

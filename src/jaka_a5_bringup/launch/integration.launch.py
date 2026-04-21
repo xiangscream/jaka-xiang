@@ -16,6 +16,7 @@ def generate_launch_description():
 
     enable_vision = LaunchConfiguration('enable_vision')
     enable_servo_controller = LaunchConfiguration('enable_servo_controller')
+    enable_moveit_coordinator = LaunchConfiguration('enable_moveit_coordinator')
     enable_camera_monitor = LaunchConfiguration('enable_camera_monitor')
 
     gazebo = IncludeLaunchDescription(
@@ -56,6 +57,7 @@ def generate_launch_description():
                 ),
                 launch_arguments={
                     'enable_servo_controller': enable_servo_controller,
+                    'enable_moveit_coordinator': enable_moveit_coordinator,
                 }.items()
             )
         ]
@@ -88,6 +90,11 @@ def generate_launch_description():
             'enable_servo_controller',
             default_value='false',
             description='Start automatic visual servo controller'
+        ),
+        DeclareLaunchArgument(
+            'enable_moveit_coordinator',
+            default_value='false',
+            description='Use MoveIt to reach pre_grasp before enabling visual servo'
         ),
         DeclareLaunchArgument(
             'enable_camera_monitor',
