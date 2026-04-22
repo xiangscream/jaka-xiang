@@ -9,7 +9,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Int32
 
 from jaka_a5_vision.experiment_logger import CsvExperimentLogger
 
@@ -20,6 +20,7 @@ class PregraspCoordinator(Node):
 
         self.declare_parameter('pre_grasp_topic', '/task_frames/pre_grasp')
         self.declare_parameter('servo_enable_topic', '/visual_servo/enable')
+        self.declare_parameter('servo_cycle_topic', '/visual_servo/cycle_id')
         self.declare_parameter('joint_state_topic', '/joint_states')
         self.declare_parameter('move_action_name', '/move_action')
         self.declare_parameter('group_name', 'manipulator')
@@ -37,6 +38,7 @@ class PregraspCoordinator(Node):
 
         self.pre_grasp_topic = str(self.get_parameter('pre_grasp_topic').value)
         self.servo_enable_topic = str(self.get_parameter('servo_enable_topic').value)
+        self.servo_cycle_topic = str(self.get_parameter('servo_cycle_topic').value)
         self.joint_state_topic = str(self.get_parameter('joint_state_topic').value)
         self.move_action_name = str(self.get_parameter('move_action_name').value)
         self.group_name = str(self.get_parameter('group_name').value)
@@ -60,6 +62,8 @@ class PregraspCoordinator(Node):
         self.goal_handle = None
         self.waiting_for_server_logged = False
         self.last_attempt_time = None
+        self.current_cycle_id = 0
+        self.last_goal_cycle_id = 0
         self.event_logger = CsvExperimentLogger(self.event_log_path)
 
         enable_qos = QoSProfile(depth=1)
@@ -68,6 +72,7 @@ class PregraspCoordinator(Node):
         self.servo_enable_pub = self.create_publisher(Bool, self.servo_enable_topic, enable_qos)
 
         self.pre_grasp_sub = self.create_subscription(PoseStamped, self.pre_grasp_topic, self.pre_grasp_callback, 10)
+        self.servo_cycle_sub = self.create_subscription(Int32, self.servo_cycle_topic, self.servo_cycle_callback, 10)
         self.joint_state_sub = self.create_subscription(JointState, self.joint_state_topic, self.joint_state_callback, 20)
         self.move_group_client = ActionClient(self, MoveGroup, self.move_action_name)
 
@@ -82,6 +87,27 @@ class PregraspCoordinator(Node):
 
     def joint_state_callback(self, msg: JointState) -> None:
         self.current_joint_state = msg
+
+    def servo_cycle_callback(self, msg: Int32) -> None:
+        if msg.data == self.current_cycle_id:
+            return
+
+        previous_cycle_id = self.current_cycle_id
+        self.current_cycle_id = msg.data
+        self.move_group_goal_sent = False
+        self.move_group_done = False
+        self.goal_handle = None
+        self.last_attempt_time = None
+        self.waiting_for_server_logged = False
+        if self.current_cycle_id > 0:
+            self.get_logger().info(
+                f'收到新的视觉伺服周期 ID: {previous_cycle_id} -> {self.current_cycle_id}，重置粗定位协调状态'
+            )
+            self._log_event(
+                self.current_cycle_id,
+                'cycle_id_updated',
+                f'coarse-position coordinator reset for new cycle {self.current_cycle_id}',
+            )
 
     def publish_enable_state(self) -> None:
         msg = Bool()
@@ -116,9 +142,10 @@ class PregraspCoordinator(Node):
         self.waiting_for_server_logged = False
         goal = self._build_goal(self.latest_pre_grasp)
         self.move_group_goal_sent = True
+        self.last_goal_cycle_id = self.current_cycle_id
         self.last_attempt_time = self.get_clock().now()
         self.get_logger().info('发送 MoveIt 粗定位目标到 pre_grasp')
-        self._log_event(0, 'moveit_goal_sent', '发送 MoveIt 粗定位目标到 pre_grasp')
+        self._log_event(self.current_cycle_id, 'moveit_goal_sent', '发送 MoveIt 粗定位目标到 pre_grasp')
         future = self.move_group_client.send_goal_async(goal)
         future.add_done_callback(self._handle_goal_response)
 
@@ -175,13 +202,13 @@ class PregraspCoordinator(Node):
         except Exception as exc:  # noqa: BLE001
             self.move_group_goal_sent = False
             self.get_logger().warn(f'发送 MoveIt 目标失败: {exc}')
-            self._log_event(0, 'moveit_failure', f'发送 MoveIt 目标失败: {exc}')
+            self._log_event(self.last_goal_cycle_id, 'moveit_failure', f'发送 MoveIt 目标失败: {exc}')
             return
 
         if not self.goal_handle.accepted:
             self.move_group_goal_sent = False
             self.get_logger().warn('MoveIt 拒绝了 pre_grasp 粗定位目标')
-            self._log_event(0, 'moveit_failure', 'MoveIt 拒绝了 pre_grasp 粗定位目标')
+            self._log_event(self.last_goal_cycle_id, 'moveit_failure', 'MoveIt 拒绝了 pre_grasp 粗定位目标')
             return
 
         result_future = self.goal_handle.get_result_async()
@@ -193,19 +220,19 @@ class PregraspCoordinator(Node):
         except Exception as exc:  # noqa: BLE001
             self.move_group_goal_sent = False
             self.get_logger().warn(f'获取 MoveIt 执行结果失败: {exc}')
-            self._log_event(0, 'moveit_failure', f'获取 MoveIt 执行结果失败: {exc}')
+            self._log_event(self.last_goal_cycle_id, 'moveit_failure', f'获取 MoveIt 执行结果失败: {exc}')
             return
 
         if result.error_code.val == 1:
             self.move_group_done = True
             mode = 'plan-only' if self.plan_only else 'plan-and-execute'
             self.get_logger().info(f'MoveIt 粗定位成功（{mode}），开始使能视觉伺服')
-            self._log_event(0, 'moveit_success', f'MoveIt 粗定位成功（{mode}）')
+            self._log_event(self.last_goal_cycle_id, 'moveit_success', f'MoveIt 粗定位成功（{mode}）')
             return
 
         self.move_group_goal_sent = False
         self.get_logger().warn(f'MoveIt 粗定位失败，错误码 {result.error_code.val}')
-        self._log_event(0, 'moveit_failure', f'MoveIt 粗定位失败，错误码 {result.error_code.val}')
+        self._log_event(self.last_goal_cycle_id, 'moveit_failure', f'MoveIt 粗定位失败，错误码 {result.error_code.val}')
 
     def _sim_time_sec(self) -> float:
         return self.get_clock().now().nanoseconds / 1e9

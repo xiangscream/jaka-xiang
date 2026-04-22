@@ -10,7 +10,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from ros_gz_interfaces.msg import Entity
 from ros_gz_interfaces.srv import SetEntityPose
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Int32
 from tf2_ros import Buffer, TransformException, TransformListener
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
@@ -243,6 +243,7 @@ class VisualServoController(Node):
         self.declare_parameter('grasp_target_topic', '/task_frames/grasp_target')
         self.declare_parameter('place_target_topic', '/task_frames/place_target')
         self.declare_parameter('servo_enable_topic', '')
+        self.declare_parameter('servo_cycle_topic', '/visual_servo/cycle_id')
         self.declare_parameter('event_log_path', '/tmp/jaka_a5_experiment_log.csv')
 
         self.joint_names = list(self.get_parameter('joint_names').value)
@@ -300,6 +301,7 @@ class VisualServoController(Node):
         self.grasp_target_topic = self.get_parameter('grasp_target_topic').value
         self.place_target_topic = self.get_parameter('place_target_topic').value
         self.servo_enable_topic = str(self.get_parameter('servo_enable_topic').value)
+        self.servo_cycle_topic = str(self.get_parameter('servo_cycle_topic').value)
         self.event_log_path = str(self.get_parameter('event_log_path').value)
 
         self.state = ServoState.S0_STANDBY
@@ -338,6 +340,8 @@ class VisualServoController(Node):
         self.target_confirmed = False
         self.fresh_target_cycles = 0
         self.fresh_target_hold_start_time = None
+        self.search_pause_logged = False
+        self.last_confirmation_gate_reason: Optional[str] = None
         self.cycle_id = 0
         self.active_cycle_id = 0
         self.state_enter_time = self.get_clock().now()
@@ -350,6 +354,7 @@ class VisualServoController(Node):
         self.pre_grasp_pub = self.create_publisher(PoseStamped, self.pre_grasp_topic, 10)
         self.grasp_target_pub = self.create_publisher(PoseStamped, self.grasp_target_topic, 10)
         self.place_target_pub = self.create_publisher(PoseStamped, self.place_target_topic, 10)
+        self.servo_cycle_pub = self.create_publisher(Int32, self.servo_cycle_topic, 10)
         self.target_sub = self.create_subscription(PoseStamped, self.target_topic, self.target_callback, 10)
         self.tag_pose_world_sub = self.create_subscription(PoseStamped, self.tag_pose_world_topic, self.tag_pose_world_callback, 10)
         self.battery_center_sub = self.create_subscription(PoseStamped, self.battery_center_topic, self.battery_center_callback, 10)
@@ -403,15 +408,17 @@ class VisualServoController(Node):
     def control_loop(self) -> None:
         self._update_attached_battery_pose()
         self._update_target_confirmation()
-        self._publish_task_frames()
 
         if self.state == ServoState.S0_STANDBY and not self.task_cycle_complete and self.target_confirmed:
             self._freeze_task_targets()
             self._start_cycle_if_needed('fresh AprilTag target acquired')
+            self._publish_cycle_id()
             self._set_state(
                 ServoState.S1_SIDE_APPROACH,
                 'Target confirmed during fan search, waiting for coarse side-approach completion',
             )
+
+        self._publish_task_frames()
 
         if self.state == ServoState.S0_STANDBY and not self.target_confirmed:
             self._hold_search_observation_pose()
@@ -562,6 +569,18 @@ class VisualServoController(Node):
         return [self.current_joint_state[name] for name in self.joint_names]
 
     def _hold_search_observation_pose(self) -> None:
+        if self._has_fresh_target() or self.fresh_target_hold_start_time is not None:
+            if not self.search_pause_logged:
+                self.get_logger().info('Tag 已进入可确认窗口，暂停继续搜索并保持当前视角')
+                self._log_event(
+                    'search_paused',
+                    'fresh target visible in standby; pausing observation-pose return and spiral search',
+                )
+                self.search_pause_logged = True
+            return
+
+        self.search_pause_logged = False
+
         if not self._joint_state_ready() or self.awaiting_motion or self.pending_ik_future is not None:
             return
 
@@ -1048,26 +1067,58 @@ class VisualServoController(Node):
             ).nanoseconds / 1e9
             bypass_search_gate = visible_duration >= self.search_lock_visible_duration
         else:
+            if (
+                self.state == ServoState.S0_STANDBY
+                and not self.target_confirmed
+                and self.fresh_target_hold_start_time is not None
+            ):
+                self._set_confirmation_gate_reason(
+                    'fresh_target_lost',
+                    'fresh target visibility was interrupted before confirmation completed',
+                )
             self.fresh_target_hold_start_time = None
+            self.search_pause_logged = False
 
         if (
             self.state == ServoState.S0_STANDBY
             and self.search_sweep_steps_completed < self.min_search_sweep_steps_before_lock
             and not bypass_search_gate
         ):
+            if fresh_target:
+                visible_duration = (
+                    self.get_clock().now() - self.fresh_target_hold_start_time
+                ).nanoseconds / 1e9
+                remaining_duration = max(0.0, self.search_lock_visible_duration - visible_duration)
+                self._set_confirmation_gate_reason(
+                    'waiting_bypass_visible_duration',
+                    f'stable visible duration {visible_duration:.2f}s below bypass threshold; '
+                    f'{remaining_duration:.2f}s remaining before search-step gate is bypassed',
+                )
+            else:
+                self._set_confirmation_gate_reason(
+                    'blocked_by_min_sweep',
+                    f'search sweep steps {self.search_sweep_steps_completed}/'
+                    f'{self.min_search_sweep_steps_before_lock} and target not yet fresh',
+                )
             self.fresh_target_cycles = max(0, self.fresh_target_cycles - 1)
             self.target_confirmed = False
             return
 
         if fresh_target:
+            self._clear_confirmation_gate_reason()
             self.fresh_target_cycles = min(self.fresh_target_cycles + 1, self.target_confirm_cycles)
         else:
+            self._set_confirmation_gate_reason(
+                'target_not_fresh',
+                'target pose did not satisfy fresh receipt/stamp timeout checks',
+            )
             self.fresh_target_cycles = max(0, self.fresh_target_cycles - 1)
             self.target_confirmed = False
             return
 
         if not self.target_confirmed and self.fresh_target_cycles >= self.target_confirm_cycles:
             self.target_confirmed = True
+            self._clear_confirmation_gate_reason()
             if (
                 self.state == ServoState.S0_STANDBY
                 and self.search_sweep_steps_completed < self.min_search_sweep_steps_before_lock
@@ -1087,6 +1138,15 @@ class VisualServoController(Node):
 
     def _should_publish_target_frames(self) -> bool:
         return self.target_confirmed or self.state != ServoState.S0_STANDBY
+
+    def _set_confirmation_gate_reason(self, reason: str, detail: str) -> None:
+        if self.last_confirmation_gate_reason == reason:
+            return
+        self.last_confirmation_gate_reason = reason
+        self._log_event(reason, detail)
+
+    def _clear_confirmation_gate_reason(self) -> None:
+        self.last_confirmation_gate_reason = None
 
     def _freeze_task_targets(self) -> None:
         if self.frozen_pre_grasp_transform is None:
@@ -1135,6 +1195,11 @@ class VisualServoController(Node):
         self.cycle_id += 1
         self.active_cycle_id = self.cycle_id
         self._log_event('cycle_started', reason, state=self.state.value)
+
+    def _publish_cycle_id(self) -> None:
+        msg = Int32()
+        msg.data = self.active_cycle_id
+        self.servo_cycle_pub.publish(msg)
 
     def _state_duration_sec(self) -> float:
         return (self.get_clock().now() - self.state_enter_time).nanoseconds / 1e9
