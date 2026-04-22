@@ -22,7 +22,7 @@ class AprilTagSubscriber(Node):
         self.declare_parameter('publish_rate', 10.0)
         self.declare_parameter('transform_timeout', 0.2)
         self.declare_parameter('tag_to_battery_center', 0.011)
-        self.declare_parameter('max_pose_age', 0.8)
+        self.declare_parameter('max_pose_age', 1.5)
 
         self.target_pose_topic = str(self.get_parameter('target_pose_topic').value)
         self.tag_pose_camera_topic = str(self.get_parameter('tag_pose_camera_topic').value)

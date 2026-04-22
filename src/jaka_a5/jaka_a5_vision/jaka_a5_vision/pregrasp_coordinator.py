@@ -34,6 +34,7 @@ class PregraspCoordinator(Node):
         self.declare_parameter('max_acceleration_scaling_factor', 0.25)
         self.declare_parameter('plan_only', False)
         self.declare_parameter('retry_delay', 1.5)
+        self.declare_parameter('max_moveit_failures_before_servo_fallback', 1)
         self.declare_parameter('event_log_path', '/tmp/jaka_a5_experiment_log.csv')
 
         self.pre_grasp_topic = str(self.get_parameter('pre_grasp_topic').value)
@@ -52,16 +53,22 @@ class PregraspCoordinator(Node):
         self.max_acceleration_scaling_factor = float(self.get_parameter('max_acceleration_scaling_factor').value)
         self.plan_only = bool(self.get_parameter('plan_only').value)
         self.retry_delay = float(self.get_parameter('retry_delay').value)
+        self.max_moveit_failures_before_servo_fallback = max(
+            1, int(self.get_parameter('max_moveit_failures_before_servo_fallback').value)
+        )
         self.event_log_path = str(self.get_parameter('event_log_path').value)
 
         self.latest_pre_grasp: Optional[PoseStamped] = None
         self.latest_pre_grasp_time = None
+        self.latest_pre_grasp_cycle_id = -1
         self.current_joint_state: Optional[JointState] = None
         self.move_group_goal_sent = False
         self.move_group_done = False
         self.goal_handle = None
         self.waiting_for_server_logged = False
         self.last_attempt_time = None
+        self.consecutive_moveit_failures = 0
+        self.fallback_servo_enabled = False
         self.current_cycle_id = 0
         self.last_goal_cycle_id = 0
         self.event_logger = CsvExperimentLogger(self.event_log_path)
@@ -84,6 +91,7 @@ class PregraspCoordinator(Node):
     def pre_grasp_callback(self, msg: PoseStamped) -> None:
         self.latest_pre_grasp = msg
         self.latest_pre_grasp_time = self.get_clock().now()
+        self.latest_pre_grasp_cycle_id = self.current_cycle_id
 
     def joint_state_callback(self, msg: JointState) -> None:
         self.current_joint_state = msg
@@ -99,6 +107,11 @@ class PregraspCoordinator(Node):
         self.goal_handle = None
         self.last_attempt_time = None
         self.waiting_for_server_logged = False
+        self.consecutive_moveit_failures = 0
+        self.fallback_servo_enabled = False
+        self.latest_pre_grasp = None
+        self.latest_pre_grasp_time = None
+        self.latest_pre_grasp_cycle_id = -1
         if self.current_cycle_id > 0:
             self.get_logger().info(
                 f'收到新的视觉伺服周期 ID: {previous_cycle_id} -> {self.current_cycle_id}，重置粗定位协调状态'
@@ -111,14 +124,20 @@ class PregraspCoordinator(Node):
 
     def publish_enable_state(self) -> None:
         msg = Bool()
-        msg.data = self.move_group_done
+        msg.data = self.move_group_done or self.fallback_servo_enabled
         self.servo_enable_pub.publish(msg)
 
     def control_loop(self) -> None:
-        if self.move_group_done or self.move_group_goal_sent:
+        if self.move_group_done or self.fallback_servo_enabled or self.move_group_goal_sent:
+            return
+
+        if self.current_cycle_id <= 0:
             return
 
         if self.latest_pre_grasp is None or self.latest_pre_grasp_time is None:
+            return
+
+        if self.latest_pre_grasp_cycle_id != self.current_cycle_id:
             return
 
         age = (self.get_clock().now() - self.latest_pre_grasp_time).nanoseconds / 1e9
@@ -202,13 +221,13 @@ class PregraspCoordinator(Node):
         except Exception as exc:  # noqa: BLE001
             self.move_group_goal_sent = False
             self.get_logger().warn(f'发送 MoveIt 目标失败: {exc}')
-            self._log_event(self.last_goal_cycle_id, 'moveit_failure', f'发送 MoveIt 目标失败: {exc}')
+            self._register_moveit_failure(f'发送 MoveIt 目标失败: {exc}')
             return
 
         if not self.goal_handle.accepted:
             self.move_group_goal_sent = False
             self.get_logger().warn('MoveIt 拒绝了 pre_grasp 粗定位目标')
-            self._log_event(self.last_goal_cycle_id, 'moveit_failure', 'MoveIt 拒绝了 pre_grasp 粗定位目标')
+            self._register_moveit_failure('MoveIt 拒绝了 pre_grasp 粗定位目标')
             return
 
         result_future = self.goal_handle.get_result_async()
@@ -220,11 +239,13 @@ class PregraspCoordinator(Node):
         except Exception as exc:  # noqa: BLE001
             self.move_group_goal_sent = False
             self.get_logger().warn(f'获取 MoveIt 执行结果失败: {exc}')
-            self._log_event(self.last_goal_cycle_id, 'moveit_failure', f'获取 MoveIt 执行结果失败: {exc}')
+            self._register_moveit_failure(f'获取 MoveIt 执行结果失败: {exc}')
             return
 
         if result.error_code.val == 1:
             self.move_group_done = True
+            self.fallback_servo_enabled = False
+            self.consecutive_moveit_failures = 0
             mode = 'plan-only' if self.plan_only else 'plan-and-execute'
             self.get_logger().info(f'MoveIt 粗定位成功（{mode}），开始使能视觉伺服')
             self._log_event(self.last_goal_cycle_id, 'moveit_success', f'MoveIt 粗定位成功（{mode}）')
@@ -232,7 +253,26 @@ class PregraspCoordinator(Node):
 
         self.move_group_goal_sent = False
         self.get_logger().warn(f'MoveIt 粗定位失败，错误码 {result.error_code.val}')
-        self._log_event(self.last_goal_cycle_id, 'moveit_failure', f'MoveIt 粗定位失败，错误码 {result.error_code.val}')
+        self._register_moveit_failure(f'MoveIt 粗定位失败，错误码 {result.error_code.val}')
+
+    def _register_moveit_failure(self, detail: str) -> None:
+        self.consecutive_moveit_failures += 1
+        self._log_event(self.last_goal_cycle_id, 'moveit_failure', detail)
+        if self.consecutive_moveit_failures < self.max_moveit_failures_before_servo_fallback:
+            return
+        if self.fallback_servo_enabled:
+            return
+
+        self.fallback_servo_enabled = True
+        self.move_group_goal_sent = False
+        self.get_logger().warn(
+            'MoveIt 粗定位连续失败，降级为直接视觉伺服（跳过粗定位）'
+        )
+        self._log_event(
+            self.last_goal_cycle_id,
+            'moveit_fallback_enable_servo',
+            'MoveIt coarse positioning failed repeatedly; enabling direct visual servo fallback',
+        )
 
     def _sim_time_sec(self) -> float:
         return self.get_clock().now().nanoseconds / 1e9
@@ -246,7 +286,7 @@ class PregraspCoordinator(Node):
             event=event,
             detail=detail,
             target_fresh=self.latest_pre_grasp is not None,
-            servo_enabled=self.move_group_done,
+            servo_enabled=(self.move_group_done or self.fallback_servo_enabled),
             battery_attached=None,
         )
 
