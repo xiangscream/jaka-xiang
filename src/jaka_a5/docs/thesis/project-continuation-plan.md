@@ -1,6 +1,6 @@
 # JAKA A5 Project Continuation Plan
 
-Last updated: 2026-04-21
+Last updated: 2026-04-22
 
 Purpose:
 - Record the current engineering judgment and next execution steps so future work can resume directly from the repository state.
@@ -40,6 +40,10 @@ Purpose:
   - the coordinator sends a MoveIt `MoveGroup` goal for coarse positioning
   - after successful coarse positioning, it publishes `/visual_servo/enable`
   - `vs_controller.py` can now wait for that external enable signal before starting fine alignment
+- Priority 3 is partially implemented with machine-readable experiment logging:
+  - `experiment_logger.py` writes a shared CSV event log
+  - `vs_controller.py` records state transitions, stage durations, IK failures, trajectory timeouts, target loss, set-pose failures, and cycle completion
+  - `pregrasp_coordinator.py` records MoveIt coarse-positioning success/failure
 - Fine alignment semantics are now explicit:
   - `ALIGN` means "keep the tag centered while moving to the final grasp pose"
   - when the tag is centered and the camera-to-tag distance reaches 3 cm, the controller transitions directly to `GRASP`
@@ -48,6 +52,7 @@ Purpose:
   - `integration.launch.py`
   - `vs.launch.py`
   - launch argument: `enable_moveit_coordinator:=true`
+  - launch argument: `event_log_path:=/tmp/jaka_a5_experiment_log.csv`
 
 ## Scope Freeze
 
@@ -212,7 +217,8 @@ Validation:
 
 Target files:
 - `src/jaka_a5/jaka_a5_vision/jaka_a5_vision/vs_controller.py`
-- possibly a new metrics/logging helper
+- `src/jaka_a5/jaka_a5_vision/jaka_a5_vision/pregrasp_coordinator.py`
+- `src/jaka_a5/jaka_a5_vision/jaka_a5_vision/experiment_logger.py`
 
 Minimum required signals:
 - current state
@@ -225,6 +231,10 @@ Minimum required signals:
 
 Desired artifact:
 - CSV, rosbag, or another simple machine-readable experiment log.
+
+Current status:
+- Minimal CSV event logging is now implemented in the repository.
+- Remaining work is runtime validation and experiment collection, not logger scaffolding.
 
 ## Recommended Minimal Thesis Claims
 
@@ -261,12 +271,8 @@ Avoid unsupported wording:
 
 ### Days 7-8
 
-- Add logging for:
-  - tag loss
-  - IK failure
-  - trajectory timeout
-  - set-pose failure
-  - total task duration
+- Export and inspect `/tmp/jaka_a5_experiment_log.csv` from a real run.
+- Confirm that stage durations, failures, and final success events are recorded as expected.
 
 ### Days 9-10
 

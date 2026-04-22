@@ -18,6 +18,7 @@ def generate_launch_description():
     enable_servo_controller = LaunchConfiguration('enable_servo_controller')
     enable_moveit_coordinator = LaunchConfiguration('enable_moveit_coordinator')
     enable_camera_monitor = LaunchConfiguration('enable_camera_monitor')
+    event_log_path = LaunchConfiguration('event_log_path')
 
     gazebo = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -58,6 +59,7 @@ def generate_launch_description():
                 launch_arguments={
                     'enable_servo_controller': enable_servo_controller,
                     'enable_moveit_coordinator': enable_moveit_coordinator,
+                    'event_log_path': event_log_path,
                 }.items()
             )
         ]
@@ -100,6 +102,11 @@ def generate_launch_description():
             'enable_camera_monitor',
             default_value='false',
             description='Open a separate /camera/image_raw window'
+        ),
+        DeclareLaunchArgument(
+            'event_log_path',
+            default_value='/tmp/jaka_a5_experiment_log.csv',
+            description='Shared CSV event log for coordinator and visual servo controller'
         ),
         gazebo,
         control,

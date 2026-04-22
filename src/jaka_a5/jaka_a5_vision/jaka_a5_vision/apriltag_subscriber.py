@@ -22,7 +22,7 @@ class AprilTagSubscriber(Node):
         self.declare_parameter('publish_rate', 10.0)
         self.declare_parameter('transform_timeout', 0.2)
         self.declare_parameter('tag_to_battery_center', 0.011)
-        self.declare_parameter('max_pose_age', 0.5)
+        self.declare_parameter('max_pose_age', 0.8)
 
         self.target_pose_topic = str(self.get_parameter('target_pose_topic').value)
         self.tag_pose_camera_topic = str(self.get_parameter('tag_pose_camera_topic').value)
@@ -128,11 +128,19 @@ class AprilTagSubscriber(Node):
                 timeout=self.transform_timeout_duration,
             )
         except TransformException as exc:
-            self.get_logger().warn(
-                f'Waiting for transform {target_frame} -> {source_frame}: {exc}',
-                throttle_duration_sec=2.0,
-            )
-            return None
+            try:
+                transform = self.tf_buffer.lookup_transform(
+                    target_frame,
+                    source_frame,
+                    Time(),
+                    timeout=self.transform_timeout_duration,
+                )
+            except TransformException:
+                self.get_logger().warn(
+                    f'Waiting for transform {target_frame} -> {source_frame}: {exc}',
+                    throttle_duration_sec=2.0,
+                )
+                return None
 
         pose = PoseStamped()
         pose.header = transform.header

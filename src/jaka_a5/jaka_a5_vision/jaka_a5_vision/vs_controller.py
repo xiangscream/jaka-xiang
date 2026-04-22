@@ -14,6 +14,8 @@ from std_msgs.msg import Bool
 from tf2_ros import Buffer, TransformException, TransformListener
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
+from jaka_a5_vision.experiment_logger import CsvExperimentLogger
+
 
 TransformData = Tuple[List[List[float]], List[float]]
 
@@ -207,7 +209,18 @@ class VisualServoController(Node):
         self.declare_parameter('xy_tolerance', 0.012)
         self.declare_parameter('z_tolerance', 0.015)
         self.declare_parameter('align_loss_grace_cycles', 5)
-        self.declare_parameter('search_observation_joints', [0.20, 1.82, -2.08, 0.31, 0.22, 0.0])
+        self.declare_parameter(
+            'search_observation_joints',
+            [0.20943951023931953, 1.9198621771937625, -2.181661564992912, 0.3141592653589793, 0.22689280275926285, 0.0],
+        )
+        self.declare_parameter('target_confirm_cycles', 3)
+        self.declare_parameter('min_search_sweep_steps_before_lock', 6)
+        self.declare_parameter('search_lock_visible_duration', 1.2)
+        self.declare_parameter('search_spiral_radial_step', 0.012)
+        self.declare_parameter('search_spiral_max_radius', 0.05)
+        self.declare_parameter('search_spiral_angle_step', 0.6)
+        self.declare_parameter('search_spiral_start_angle', 0.0)
+        self.declare_parameter('search_ik_failure_reset_threshold', 3)
         self.declare_parameter('xy_gain', 0.7)
         self.declare_parameter('z_gain', 0.6)
         self.declare_parameter('max_servo_step', 0.025)
@@ -230,6 +243,7 @@ class VisualServoController(Node):
         self.declare_parameter('grasp_target_topic', '/task_frames/grasp_target')
         self.declare_parameter('place_target_topic', '/task_frames/place_target')
         self.declare_parameter('servo_enable_topic', '')
+        self.declare_parameter('event_log_path', '/tmp/jaka_a5_experiment_log.csv')
 
         self.joint_names = list(self.get_parameter('joint_names').value)
         self.target_topic = self.get_parameter('target_topic').value
@@ -250,6 +264,20 @@ class VisualServoController(Node):
         self.z_tolerance = float(self.get_parameter('z_tolerance').value)
         self.align_loss_grace_cycles = max(1, int(self.get_parameter('align_loss_grace_cycles').value))
         self.search_observation_joints = [float(value) for value in self.get_parameter('search_observation_joints').value]
+        self.target_confirm_cycles = max(1, int(self.get_parameter('target_confirm_cycles').value))
+        self.min_search_sweep_steps_before_lock = max(
+            0, int(self.get_parameter('min_search_sweep_steps_before_lock').value)
+        )
+        self.search_lock_visible_duration = max(
+            0.0, float(self.get_parameter('search_lock_visible_duration').value)
+        )
+        self.search_spiral_radial_step = float(self.get_parameter('search_spiral_radial_step').value)
+        self.search_spiral_max_radius = float(self.get_parameter('search_spiral_max_radius').value)
+        self.search_spiral_angle_step = float(self.get_parameter('search_spiral_angle_step').value)
+        self.search_spiral_start_angle = float(self.get_parameter('search_spiral_start_angle').value)
+        self.search_ik_failure_reset_threshold = max(
+            1, int(self.get_parameter('search_ik_failure_reset_threshold').value)
+        )
         self.xy_gain = float(self.get_parameter('xy_gain').value)
         self.z_gain = float(self.get_parameter('z_gain').value)
         self.max_servo_step = float(self.get_parameter('max_servo_step').value)
@@ -272,6 +300,7 @@ class VisualServoController(Node):
         self.grasp_target_topic = self.get_parameter('grasp_target_topic').value
         self.place_target_topic = self.get_parameter('place_target_topic').value
         self.servo_enable_topic = str(self.get_parameter('servo_enable_topic').value)
+        self.event_log_path = str(self.get_parameter('event_log_path').value)
 
         self.state = ServoState.S0_STANDBY
         self.current_joint_state: Dict[str, float] = {}
@@ -282,6 +311,7 @@ class VisualServoController(Node):
         self.last_battery_center_pose: Optional[PoseStamped] = None
         self.commanded_joint_positions: Optional[List[float]] = None
         self.last_command_time = None
+        self.last_target_feedback_time = None
         self.awaiting_motion = False
         self.pending_ik_future = None
         self.pending_set_pose_future = None
@@ -292,10 +322,26 @@ class VisualServoController(Node):
         self.service_warning_emitted = False
         self.attach_service_warning_emitted = False
         self.servo_enabled = not self.servo_enable_topic
+        self.last_logged_servo_enabled: Optional[bool] = None
         self.servo_gate_logged = False
         self.task_cycle_complete = False
         self.search_pose_commanded = False
+        self.search_sweep_started = False
+        self.search_sweep_index = 0
+        self.search_sweep_steps_completed = 0
+        self.search_anchor_tool: Optional[TransformData] = None
+        self.search_anchor_camera: Optional[TransformData] = None
+        self.frozen_pre_grasp_transform: Optional[TransformData] = None
+        self.frozen_grasp_transform: Optional[TransformData] = None
+        self.search_ik_failure_count = 0
         self.align_target_missing_cycles = 0
+        self.target_confirmed = False
+        self.fresh_target_cycles = 0
+        self.fresh_target_hold_start_time = None
+        self.cycle_id = 0
+        self.active_cycle_id = 0
+        self.state_enter_time = self.get_clock().now()
+        self.event_logger = CsvExperimentLogger(self.event_log_path)
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -325,11 +371,13 @@ class VisualServoController(Node):
 
         self.control_timer = self.create_timer(0.2, self.control_loop)
         self.get_logger().info('IK visual servo controller started')
+        self._log_event('controller_started', f'CSV logging enabled at {self.event_log_path}')
 
     def target_callback(self, msg: PoseStamped) -> None:
         self.last_target_pose = msg
         self.last_target_received_time = self.get_clock().now()
         self.last_target_stamp = rclpy.time.Time.from_msg(msg.header.stamp)
+        self._log_target_feedback(msg)
 
     def tag_pose_world_callback(self, msg: PoseStamped) -> None:
         self.last_tag_pose_world = msg
@@ -338,8 +386,13 @@ class VisualServoController(Node):
         self.last_battery_center_pose = msg
 
     def servo_enable_callback(self, msg: Bool) -> None:
+        previous_value = self.servo_enabled
         self.servo_enabled = msg.data
         self.servo_gate_logged = False
+        if self.last_logged_servo_enabled is None or previous_value != self.servo_enabled:
+            state = 'enabled' if self.servo_enabled else 'disabled'
+            self._log_event('servo_gate_changed', f'visual servo {state}')
+            self.last_logged_servo_enabled = self.servo_enabled
         if not self.servo_enabled:
             self.task_cycle_complete = False
 
@@ -349,22 +402,19 @@ class VisualServoController(Node):
 
     def control_loop(self) -> None:
         self._update_attached_battery_pose()
+        self._update_target_confirmation()
         self._publish_task_frames()
 
-        if self.state == ServoState.S0_STANDBY and not self.task_cycle_complete and self._has_fresh_target():
+        if self.state == ServoState.S0_STANDBY and not self.task_cycle_complete and self.target_confirmed:
+            self._freeze_task_targets()
+            self._start_cycle_if_needed('fresh AprilTag target acquired')
             self._set_state(
                 ServoState.S1_SIDE_APPROACH,
-                'Task trigger received, waiting for coarse side-approach completion',
+                'Target confirmed during fan search, waiting for coarse side-approach completion',
             )
 
-        if self.state == ServoState.S0_STANDBY and not self._has_fresh_target():
+        if self.state == ServoState.S0_STANDBY and not self.target_confirmed:
             self._hold_search_observation_pose()
-
-        if not self.servo_enabled:
-            if not self.servo_gate_logged:
-                self.get_logger().info('Visual servo is waiting for external enable signal')
-                self.servo_gate_logged = True
-            return
 
         if not self._joint_state_ready():
             return
@@ -380,10 +430,17 @@ class VisualServoController(Node):
                 self.awaiting_motion = False
                 self.commanded_joint_positions = None
                 self.get_logger().warn('Trajectory convergence timed out, continuing with next control step')
+                self._log_event('trajectory_timeout', 'joint trajectory did not converge before timeout')
             else:
                 return
 
         if self.state == ServoState.S0_STANDBY:
+            return
+
+        if not self.servo_enabled:
+            if not self.servo_gate_logged:
+                self.get_logger().info('Visual servo is waiting for external enable signal')
+                self.servo_gate_logged = True
             return
 
         if self.state == ServoState.S1_SIDE_APPROACH:
@@ -399,6 +456,7 @@ class VisualServoController(Node):
                 self.align_target_missing_cycles += 1
                 if self.align_target_missing_cycles < self.align_loss_grace_cycles:
                     return
+                self._log_event('target_lost', 'AprilTag lost during ALIGN; returning to side-approach')
                 self._set_state(ServoState.S1_SIDE_APPROACH, 'AprilTag lost during fine alignment')
                 return
             self.align_target_missing_cycles = 0
@@ -464,7 +522,9 @@ class VisualServoController(Node):
         if self.state == ServoState.S11_RESET:
             if self._drive_tool_from_anchor(self.final_reset_offset):
                 self.task_cycle_complete = True
+                self._log_event('cycle_complete', 'battery-swap cycle finished successfully')
                 self._set_state(ServoState.S0_STANDBY, 'Battery-swap cycle complete, return to standby')
+                self.active_cycle_id = 0
             return
 
     def _joint_state_ready(self) -> bool:
@@ -521,14 +581,104 @@ class VisualServoController(Node):
         )
         if max_error < self.joint_tolerance:
             self.search_pose_commanded = True
-            return
+            if not self.search_sweep_started:
+                search_anchor_tool = self._lookup_frame_transform(self.tool_frame)
+                search_anchor_camera = self._lookup_frame_transform(self.camera_frame)
+                if search_anchor_tool is None or search_anchor_camera is None:
+                    return
+                self.search_sweep_started = True
+                self.search_sweep_index = 0
+                self.search_sweep_steps_completed = 0
+                self.search_ik_failure_count = 0
+                self.search_anchor_tool = search_anchor_tool
+                self.search_anchor_camera = search_anchor_camera
 
         if self.search_pose_commanded:
+            self._run_search_sweep(current)
             return
 
         self.get_logger().info('Moving to fixed search observation pose for AprilTag acquisition')
+        self._log_event('search_pose_commanded', 'moving to fixed observation pose for AprilTag acquisition')
         self._publish_trajectory(self.search_observation_joints)
         self.search_pose_commanded = True
+
+    def _run_search_sweep(self, current: List[float]) -> None:
+        spiral_targets = self._search_spiral_targets()
+        if not spiral_targets or self.search_anchor_tool is None or self.search_anchor_camera is None:
+            return
+
+        target_tool = spiral_targets[self.search_sweep_index]
+        current_tool = self._lookup_frame_transform(self.tool_frame)
+        if current_tool is None:
+            return
+
+        _, current_translation = current_tool
+        _, target_translation = target_tool
+        error = subtract_vectors(target_translation, current_translation)
+        distance = vector_norm(error)
+        if distance >= self.path_tolerance:
+            step_scale = min(1.0, self.path_step / max(distance, 1e-6))
+            limited_step = [component * step_scale for component in error]
+            target_rotation, _ = target_tool
+            desired_tool = make_transform(target_rotation, add_vectors(current_translation, limited_step))
+            self._request_ik_for_transform(desired_tool)
+            return
+
+        self.search_sweep_index = (self.search_sweep_index + 1) % len(spiral_targets)
+        self.search_sweep_steps_completed += 1
+        self.search_ik_failure_count = 0
+        next_target = spiral_targets[self.search_sweep_index]
+        next_camera = self._spiral_target_camera_transform(self.search_sweep_index)
+        if next_camera is None:
+            return
+
+        _, anchor_translation = self.search_anchor_camera
+        _, next_translation = next_camera
+        camera_offset = subtract_vectors(next_translation, anchor_translation)
+        self.get_logger().info(
+            'Spiral-search waypoint reached, expanding outward while keeping the camera view direction fixed'
+        )
+        self._log_event(
+            'search_sweep_step',
+            'spiral search '
+            f'camera local x/y offset -> ({camera_offset[0]:.3f}, {camera_offset[1]:.3f})',
+        )
+        self._request_ik_for_transform(next_target)
+
+    def _search_spiral_targets(self) -> List[TransformData]:
+        if self.search_anchor_tool is None or self.search_anchor_camera is None:
+            return []
+
+        targets: List[TransformData] = []
+        step_count = max(
+            1,
+            int(math.ceil(self.search_spiral_max_radius / max(self.search_spiral_radial_step, 1e-6))) * 8,
+        )
+        for index in range(step_count):
+            target = self._spiral_target_tool_transform(index)
+            if target is not None:
+                targets.append(target)
+        return targets
+
+    def _spiral_target_tool_transform(self, index: int) -> Optional[TransformData]:
+        target_camera = self._spiral_target_camera_transform(index)
+        if target_camera is None or self.search_anchor_tool is None or self.search_anchor_camera is None:
+            return None
+
+        tool_to_camera = compose_transforms(invert_transform(self.search_anchor_tool), self.search_anchor_camera)
+        return compose_transforms(target_camera, invert_transform(tool_to_camera))
+
+    def _spiral_target_camera_transform(self, index: int) -> Optional[TransformData]:
+        if self.search_anchor_camera is None:
+            return None
+
+        if index == 0:
+            return self.search_anchor_camera
+
+        angle = self.search_spiral_start_angle + index * self.search_spiral_angle_step
+        radius = min(self.search_spiral_max_radius, self.search_spiral_radial_step * math.sqrt(index))
+        local_offset = [radius * math.cos(angle), radius * math.sin(angle), 0.0]
+        return offset_along_local_axes(self.search_anchor_camera, local_offset)
 
     def _lookup_frame_transform(self, frame_name: str) -> Optional[TransformData]:
         try:
@@ -667,11 +817,20 @@ class VisualServoController(Node):
             response = future.result()
         except Exception as exc:  # noqa: BLE001
             self.get_logger().warn(f'IK request failed: {exc}')
+            self._log_event('ik_failure', f'IK request exception: {exc}')
             return
 
         if response.error_code.val != 1:
             self.get_logger().warn(
                 f'IK solver returned error {response.error_code.val} in state {self.last_requested_state}'
+            )
+            if self.last_requested_state == ServoState.S0_STANDBY:
+                self.search_ik_failure_count += 1
+                if self.search_ik_failure_count >= self.search_ik_failure_reset_threshold:
+                    self._reset_search_pattern('search IK failures exceeded threshold')
+            self._log_event(
+                'ik_failure',
+                f'IK solver error {response.error_code.val} in state {self.last_requested_state}',
             )
             return
 
@@ -681,6 +840,7 @@ class VisualServoController(Node):
         }
         if not all(name in solution_map for name in self.joint_names):
             self.get_logger().warn('IK solution missing required manipulator joints')
+            self._log_event('ik_failure', 'IK solution missing required manipulator joints')
             return
 
         ordered_positions = [solution_map[name] for name in self.joint_names]
@@ -702,6 +862,7 @@ class VisualServoController(Node):
         self.commanded_joint_positions = list(joint_positions)
         self.last_command_time = self.get_clock().now()
         self.awaiting_motion = True
+        self._log_event('trajectory_commanded', 'published joint trajectory command')
 
     def _attach_battery_to_tool(self) -> bool:
         world_tool = self._lookup_frame_transform(self.tool_frame)
@@ -772,16 +933,28 @@ class VisualServoController(Node):
             response = future.result()
         except Exception as exc:  # noqa: BLE001
             self.get_logger().warn(f'Gazebo set_pose request failed: {exc}')
+            self._log_event('set_pose_failure', f'Gazebo set_pose exception: {exc}')
             return
 
         if not response.success:
             self.get_logger().warn('Gazebo rejected battery pose update')
+            self._log_event('set_pose_failure', 'Gazebo rejected attached battery pose update')
 
     def _set_state(self, new_state: ServoState, reason: str) -> None:
         if self.state == new_state:
             return
 
+        previous_state = self.state
+        previous_duration = self._state_duration_sec()
+        self._log_event(
+            'state_exit',
+            f'{previous_state.value} -> {new_state.value}: {reason}',
+            state=previous_state.value,
+            stage_duration_sec=previous_duration,
+        )
+
         self.state = new_state
+        self.state_enter_time = self.get_clock().now()
         self.align_target_missing_cycles = 0
         self.awaiting_motion = False
         self.commanded_joint_positions = None
@@ -791,14 +964,38 @@ class VisualServoController(Node):
             self.path_anchor = None
         if new_state == ServoState.S0_STANDBY:
             self.search_pose_commanded = False
-        self.get_logger().info(f'State -> {new_state.value}: {reason}')
+            self.search_sweep_started = False
+            self.search_sweep_index = 0
+            self.search_sweep_steps_completed = 0
+            self.search_anchor_tool = None
+            self.search_anchor_camera = None
+            self.frozen_pre_grasp_transform = None
+            self.frozen_grasp_transform = None
+            self.search_ik_failure_count = 0
+            self.target_confirmed = False
+            self.fresh_target_cycles = 0
+            self.fresh_target_hold_start_time = None
+        self.get_logger().info(
+            f'状态切换: {previous_state.value} -> {new_state.value} '
+            f'(上一阶段耗时={previous_duration:.2f}s, 原因={reason})'
+        )
+        self._log_event('state_enter', reason)
 
     def _publish_task_frames(self) -> None:
-        pre_grasp = self._make_pose_stamped(self._compute_task_goal_transform(self.hover_distance))
+        if not self._should_publish_target_frames():
+            return
+
+        pre_grasp_transform = self.frozen_pre_grasp_transform
+        if pre_grasp_transform is None:
+            pre_grasp_transform = self._compute_task_goal_transform(self.hover_distance)
+        pre_grasp = self._make_pose_stamped(pre_grasp_transform)
         if pre_grasp is not None:
             self.pre_grasp_pub.publish(pre_grasp)
 
-        grasp_target = self._make_pose_stamped(self._compute_task_goal_transform(self.grasp_distance))
+        grasp_transform = self.frozen_grasp_transform
+        if grasp_transform is None:
+            grasp_transform = self._compute_task_goal_transform(self.grasp_distance)
+        grasp_target = self._make_pose_stamped(grasp_transform)
         if grasp_target is not None:
             self.grasp_target_pub.publish(grasp_target)
 
@@ -838,6 +1035,133 @@ class VisualServoController(Node):
         pose.header.stamp = self.get_clock().now().to_msg()
         pose.pose = pose_from_transform(transform)
         return pose
+
+    def _update_target_confirmation(self) -> None:
+        fresh_target = self._has_fresh_target()
+        bypass_search_gate = False
+
+        if fresh_target:
+            if self.fresh_target_hold_start_time is None:
+                self.fresh_target_hold_start_time = self.get_clock().now()
+            visible_duration = (
+                self.get_clock().now() - self.fresh_target_hold_start_time
+            ).nanoseconds / 1e9
+            bypass_search_gate = visible_duration >= self.search_lock_visible_duration
+        else:
+            self.fresh_target_hold_start_time = None
+
+        if (
+            self.state == ServoState.S0_STANDBY
+            and self.search_sweep_steps_completed < self.min_search_sweep_steps_before_lock
+            and not bypass_search_gate
+        ):
+            self.fresh_target_cycles = max(0, self.fresh_target_cycles - 1)
+            self.target_confirmed = False
+            return
+
+        if fresh_target:
+            self.fresh_target_cycles = min(self.fresh_target_cycles + 1, self.target_confirm_cycles)
+        else:
+            self.fresh_target_cycles = max(0, self.fresh_target_cycles - 1)
+            self.target_confirmed = False
+            return
+
+        if not self.target_confirmed and self.fresh_target_cycles >= self.target_confirm_cycles:
+            self.target_confirmed = True
+            if (
+                self.state == ServoState.S0_STANDBY
+                and self.search_sweep_steps_completed < self.min_search_sweep_steps_before_lock
+                and bypass_search_gate
+            ):
+                self.get_logger().info(
+                    'Tag 持续稳定可见，跳过最低扫描步数限制，直接进入粗定位'
+                )
+                self._log_event(
+                    'target_confirmation_bypass',
+                    'stable AprilTag visibility bypassed minimum search sweep steps',
+                )
+            self._log_event(
+                'target_confirmed',
+                f'AprilTag observed for {self.fresh_target_cycles} consecutive control cycles',
+            )
+
+    def _should_publish_target_frames(self) -> bool:
+        return self.target_confirmed or self.state != ServoState.S0_STANDBY
+
+    def _freeze_task_targets(self) -> None:
+        if self.frozen_pre_grasp_transform is None:
+            self.frozen_pre_grasp_transform = self._compute_task_goal_transform(self.hover_distance)
+        if self.frozen_grasp_transform is None:
+            self.frozen_grasp_transform = self._compute_task_goal_transform(self.grasp_distance)
+
+    def _reset_search_pattern(self, reason: str) -> None:
+        self.search_sweep_started = False
+        self.search_pose_commanded = False
+        self.search_sweep_index = 0
+        self.search_sweep_steps_completed = 0
+        self.search_anchor_tool = None
+        self.search_anchor_camera = None
+        self.search_ik_failure_count = 0
+        self._log_event('search_reset', reason)
+
+    def _log_target_feedback(self, msg: PoseStamped) -> None:
+        now = self.get_clock().now()
+        if self.last_target_feedback_time is not None:
+            age = (now - self.last_target_feedback_time).nanoseconds / 1e9
+            if age < 0.8:
+                return
+
+        world_tool = self._lookup_frame_transform(self.tool_frame)
+        world_camera = self._lookup_frame_transform(self.camera_frame)
+        if world_tool is None or world_camera is None:
+            return
+
+        camera_to_tag = transform_from_pose(msg.pose)
+        tool_to_camera = compose_transforms(invert_transform(world_tool), world_camera)
+        tool_to_tag = compose_transforms(tool_to_camera, camera_to_tag)
+        _, tool_translation = tool_to_tag
+        camera_translation = msg.pose.position
+
+        self.get_logger().info(
+            '检测到Tag: '
+            f'相机坐标系 xyz=({camera_translation.x:.3f}, {camera_translation.y:.3f}, {camera_translation.z:.3f}), '
+            f'末端坐标系 xyz=({tool_translation[0]:.3f}, {tool_translation[1]:.3f}, {tool_translation[2]:.3f})'
+        )
+        self.last_target_feedback_time = now
+
+    def _start_cycle_if_needed(self, reason: str) -> None:
+        if self.active_cycle_id != 0:
+            return
+        self.cycle_id += 1
+        self.active_cycle_id = self.cycle_id
+        self._log_event('cycle_started', reason, state=self.state.value)
+
+    def _state_duration_sec(self) -> float:
+        return (self.get_clock().now() - self.state_enter_time).nanoseconds / 1e9
+
+    def _sim_time_sec(self) -> float:
+        return self.get_clock().now().nanoseconds / 1e9
+
+    def _log_event(
+        self,
+        event: str,
+        detail: str,
+        *,
+        state: Optional[str] = None,
+        stage_duration_sec: Optional[float] = None,
+    ) -> None:
+        self.event_logger.log_event(
+            node='visual_servo_controller',
+            sim_time_sec=self._sim_time_sec(),
+            cycle_id=self.active_cycle_id,
+            state=state or self.state.value,
+            event=event,
+            detail=detail,
+            stage_duration_sec=stage_duration_sec,
+            target_fresh=self._has_fresh_target(),
+            servo_enabled=self.servo_enabled,
+            battery_attached=self.battery_attached,
+        )
 
 
 def main(args=None) -> None:

@@ -12,6 +12,7 @@ def generate_launch_description():
 
     enable_servo_controller = LaunchConfiguration('enable_servo_controller')
     enable_moveit_coordinator = LaunchConfiguration('enable_moveit_coordinator')
+    event_log_path = LaunchConfiguration('event_log_path')
     servo_enable_topic = '/visual_servo/enable'
 
     camera_qos_relay = Node(
@@ -47,7 +48,7 @@ def generate_launch_description():
         package='jaka_a5_vision',
         executable='vs_controller',
         name='visual_servo_controller',
-        parameters=[{'use_sim_time': True, 'servo_enable_topic': servo_enable_topic}],
+        parameters=[{'use_sim_time': True, 'servo_enable_topic': servo_enable_topic, 'event_log_path': event_log_path}],
         condition=IfCondition(enable_servo_controller),
         output='screen'
     )
@@ -56,7 +57,7 @@ def generate_launch_description():
         package='jaka_a5_vision',
         executable='pregrasp_coordinator',
         name='pregrasp_coordinator',
-        parameters=[{'use_sim_time': True, 'servo_enable_topic': servo_enable_topic}],
+        parameters=[{'use_sim_time': True, 'servo_enable_topic': servo_enable_topic, 'event_log_path': event_log_path}],
         condition=IfCondition(enable_moveit_coordinator),
         output='screen'
     )
@@ -71,6 +72,11 @@ def generate_launch_description():
             'enable_moveit_coordinator',
             default_value='false',
             description='Use MoveIt to reach pre_grasp before enabling visual servo'
+        ),
+        DeclareLaunchArgument(
+            'event_log_path',
+            default_value='/tmp/jaka_a5_experiment_log.csv',
+            description='Shared CSV event log for coordinator and visual servo controller'
         ),
         camera_qos_relay,
         apriltag,

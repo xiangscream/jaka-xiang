@@ -11,6 +11,8 @@ from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
 from std_msgs.msg import Bool
 
+from jaka_a5_vision.experiment_logger import CsvExperimentLogger
+
 
 class PregraspCoordinator(Node):
     def __init__(self) -> None:
@@ -30,6 +32,8 @@ class PregraspCoordinator(Node):
         self.declare_parameter('max_velocity_scaling_factor', 0.25)
         self.declare_parameter('max_acceleration_scaling_factor', 0.25)
         self.declare_parameter('plan_only', False)
+        self.declare_parameter('retry_delay', 1.5)
+        self.declare_parameter('event_log_path', '/tmp/jaka_a5_experiment_log.csv')
 
         self.pre_grasp_topic = str(self.get_parameter('pre_grasp_topic').value)
         self.servo_enable_topic = str(self.get_parameter('servo_enable_topic').value)
@@ -45,6 +49,8 @@ class PregraspCoordinator(Node):
         self.max_velocity_scaling_factor = float(self.get_parameter('max_velocity_scaling_factor').value)
         self.max_acceleration_scaling_factor = float(self.get_parameter('max_acceleration_scaling_factor').value)
         self.plan_only = bool(self.get_parameter('plan_only').value)
+        self.retry_delay = float(self.get_parameter('retry_delay').value)
+        self.event_log_path = str(self.get_parameter('event_log_path').value)
 
         self.latest_pre_grasp: Optional[PoseStamped] = None
         self.latest_pre_grasp_time = None
@@ -53,6 +59,8 @@ class PregraspCoordinator(Node):
         self.move_group_done = False
         self.goal_handle = None
         self.waiting_for_server_logged = False
+        self.last_attempt_time = None
+        self.event_logger = CsvExperimentLogger(self.event_log_path)
 
         enable_qos = QoSProfile(depth=1)
         enable_qos.reliability = ReliabilityPolicy.RELIABLE
@@ -66,6 +74,7 @@ class PregraspCoordinator(Node):
         self.enable_timer = self.create_timer(0.5, self.publish_enable_state)
         self.control_timer = self.create_timer(0.5, self.control_loop)
         self.get_logger().info('Pre-grasp MoveIt coordinator started')
+        self._log_event(0, 'startup', f'CSV logging enabled at {self.event_log_path}')
 
     def pre_grasp_callback(self, msg: PoseStamped) -> None:
         self.latest_pre_grasp = msg
@@ -93,16 +102,23 @@ class PregraspCoordinator(Node):
         if self.current_joint_state is None:
             return
 
+        if self.last_attempt_time is not None:
+            retry_age = (self.get_clock().now() - self.last_attempt_time).nanoseconds / 1e9
+            if retry_age < self.retry_delay:
+                return
+
         if not self.move_group_client.server_is_ready():
             if not self.waiting_for_server_logged:
-                self.get_logger().warn(f'Waiting for MoveIt action server: {self.move_action_name}')
+                self.get_logger().warn(f'等待 MoveIt 动作服务就绪: {self.move_action_name}')
                 self.waiting_for_server_logged = True
             return
 
         self.waiting_for_server_logged = False
         goal = self._build_goal(self.latest_pre_grasp)
         self.move_group_goal_sent = True
-        self.get_logger().info('Sending MoveIt coarse positioning goal to pre_grasp')
+        self.last_attempt_time = self.get_clock().now()
+        self.get_logger().info('发送 MoveIt 粗定位目标到 pre_grasp')
+        self._log_event(0, 'moveit_goal_sent', '发送 MoveIt 粗定位目标到 pre_grasp')
         future = self.move_group_client.send_goal_async(goal)
         future.add_done_callback(self._handle_goal_response)
 
@@ -158,12 +174,14 @@ class PregraspCoordinator(Node):
             self.goal_handle = future.result()
         except Exception as exc:  # noqa: BLE001
             self.move_group_goal_sent = False
-            self.get_logger().warn(f'Failed to send MoveIt goal: {exc}')
+            self.get_logger().warn(f'发送 MoveIt 目标失败: {exc}')
+            self._log_event(0, 'moveit_failure', f'发送 MoveIt 目标失败: {exc}')
             return
 
         if not self.goal_handle.accepted:
             self.move_group_goal_sent = False
-            self.get_logger().warn('MoveIt rejected the pre_grasp goal')
+            self.get_logger().warn('MoveIt 拒绝了 pre_grasp 粗定位目标')
+            self._log_event(0, 'moveit_failure', 'MoveIt 拒绝了 pre_grasp 粗定位目标')
             return
 
         result_future = self.goal_handle.get_result_async()
@@ -174,17 +192,36 @@ class PregraspCoordinator(Node):
             result = future.result().result
         except Exception as exc:  # noqa: BLE001
             self.move_group_goal_sent = False
-            self.get_logger().warn(f'MoveIt result retrieval failed: {exc}')
+            self.get_logger().warn(f'获取 MoveIt 执行结果失败: {exc}')
+            self._log_event(0, 'moveit_failure', f'获取 MoveIt 执行结果失败: {exc}')
             return
 
         if result.error_code.val == 1:
             self.move_group_done = True
             mode = 'plan-only' if self.plan_only else 'plan-and-execute'
-            self.get_logger().info(f'MoveIt coarse positioning succeeded ({mode}); enabling visual servo')
+            self.get_logger().info(f'MoveIt 粗定位成功（{mode}），开始使能视觉伺服')
+            self._log_event(0, 'moveit_success', f'MoveIt 粗定位成功（{mode}）')
             return
 
         self.move_group_goal_sent = False
-        self.get_logger().warn(f'MoveIt coarse positioning failed with error code {result.error_code.val}')
+        self.get_logger().warn(f'MoveIt 粗定位失败，错误码 {result.error_code.val}')
+        self._log_event(0, 'moveit_failure', f'MoveIt 粗定位失败，错误码 {result.error_code.val}')
+
+    def _sim_time_sec(self) -> float:
+        return self.get_clock().now().nanoseconds / 1e9
+
+    def _log_event(self, cycle_id: int, event: str, detail: str) -> None:
+        self.event_logger.log_event(
+            node='pregrasp_coordinator',
+            sim_time_sec=self._sim_time_sec(),
+            cycle_id=cycle_id,
+            state='pregrasp',
+            event=event,
+            detail=detail,
+            target_fresh=self.latest_pre_grasp is not None,
+            servo_enabled=self.move_group_done,
+            battery_attached=None,
+        )
 
 
 def main(args=None) -> None:
