@@ -17,6 +17,7 @@ def generate_launch_description():
     enable_vision = LaunchConfiguration('enable_vision')
     enable_servo_controller = LaunchConfiguration('enable_servo_controller')
     enable_moveit_coordinator = LaunchConfiguration('enable_moveit_coordinator')
+    debug_pause_on_state_transition = LaunchConfiguration('debug_pause_on_state_transition')
     enable_camera_monitor = LaunchConfiguration('enable_camera_monitor')
     event_log_path = LaunchConfiguration('event_log_path')
 
@@ -59,6 +60,7 @@ def generate_launch_description():
                 launch_arguments={
                     'enable_servo_controller': enable_servo_controller,
                     'enable_moveit_coordinator': enable_moveit_coordinator,
+                    'debug_pause_on_state_transition': debug_pause_on_state_transition,
                     'event_log_path': event_log_path,
                 }.items()
             )
@@ -97,6 +99,11 @@ def generate_launch_description():
             'enable_moveit_coordinator',
             default_value='false',
             description='Use MoveIt to reach pre_grasp before enabling visual servo'
+        ),
+        DeclareLaunchArgument(
+            'debug_pause_on_state_transition',
+            default_value='false',
+            description='Pause the visual-servo state machine after each state transition until a debug step command arrives'
         ),
         DeclareLaunchArgument(
             'enable_camera_monitor',

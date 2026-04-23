@@ -12,8 +12,10 @@ def generate_launch_description():
 
     enable_servo_controller = LaunchConfiguration('enable_servo_controller')
     enable_moveit_coordinator = LaunchConfiguration('enable_moveit_coordinator')
+    debug_pause_on_state_transition = LaunchConfiguration('debug_pause_on_state_transition')
     event_log_path = LaunchConfiguration('event_log_path')
     servo_enable_topic = '/visual_servo/enable'
+    debug_step_topic = '/visual_servo/debug_step'
 
     camera_qos_relay = Node(
         package='jaka_a5_vision',
@@ -48,7 +50,13 @@ def generate_launch_description():
         package='jaka_a5_vision',
         executable='vs_controller',
         name='visual_servo_controller',
-        parameters=[{'use_sim_time': True, 'servo_enable_topic': servo_enable_topic, 'event_log_path': event_log_path}],
+        parameters=[{
+            'use_sim_time': True,
+            'servo_enable_topic': servo_enable_topic,
+            'debug_pause_on_state_transition': debug_pause_on_state_transition,
+            'debug_step_topic': debug_step_topic,
+            'event_log_path': event_log_path,
+        }],
         condition=IfCondition(enable_servo_controller),
         output='screen'
     )
@@ -72,6 +80,11 @@ def generate_launch_description():
             'enable_moveit_coordinator',
             default_value='false',
             description='Use MoveIt to reach pre_grasp before enabling visual servo'
+        ),
+        DeclareLaunchArgument(
+            'debug_pause_on_state_transition',
+            default_value='false',
+            description='Pause the visual-servo state machine after each state transition until a debug step command arrives'
         ),
         DeclareLaunchArgument(
             'event_log_path',

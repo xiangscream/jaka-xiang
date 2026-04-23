@@ -21,6 +21,7 @@ class PregraspCoordinator(Node):
         self.declare_parameter('pre_grasp_topic', '/task_frames/pre_grasp')
         self.declare_parameter('servo_enable_topic', '/visual_servo/enable')
         self.declare_parameter('servo_cycle_topic', '/visual_servo/cycle_id')
+        self.declare_parameter('debug_hold_topic', '/visual_servo/debug_hold')
         self.declare_parameter('joint_state_topic', '/joint_states')
         self.declare_parameter('move_action_name', '/move_action')
         self.declare_parameter('group_name', 'manipulator')
@@ -40,6 +41,7 @@ class PregraspCoordinator(Node):
         self.pre_grasp_topic = str(self.get_parameter('pre_grasp_topic').value)
         self.servo_enable_topic = str(self.get_parameter('servo_enable_topic').value)
         self.servo_cycle_topic = str(self.get_parameter('servo_cycle_topic').value)
+        self.debug_hold_topic = str(self.get_parameter('debug_hold_topic').value)
         self.joint_state_topic = str(self.get_parameter('joint_state_topic').value)
         self.move_action_name = str(self.get_parameter('move_action_name').value)
         self.group_name = str(self.get_parameter('group_name').value)
@@ -71,6 +73,8 @@ class PregraspCoordinator(Node):
         self.fallback_servo_enabled = False
         self.current_cycle_id = 0
         self.last_goal_cycle_id = 0
+        self.goal_handle_cycle_id = 0
+        self.debug_hold_active = False
         self.event_logger = CsvExperimentLogger(self.event_log_path)
 
         enable_qos = QoSProfile(depth=1)
@@ -80,6 +84,7 @@ class PregraspCoordinator(Node):
 
         self.pre_grasp_sub = self.create_subscription(PoseStamped, self.pre_grasp_topic, self.pre_grasp_callback, 10)
         self.servo_cycle_sub = self.create_subscription(Int32, self.servo_cycle_topic, self.servo_cycle_callback, 10)
+        self.debug_hold_sub = self.create_subscription(Bool, self.debug_hold_topic, self.debug_hold_callback, enable_qos)
         self.joint_state_sub = self.create_subscription(JointState, self.joint_state_topic, self.joint_state_callback, 20)
         self.move_group_client = ActionClient(self, MoveGroup, self.move_action_name)
 
@@ -96,15 +101,21 @@ class PregraspCoordinator(Node):
     def joint_state_callback(self, msg: JointState) -> None:
         self.current_joint_state = msg
 
+    def debug_hold_callback(self, msg: Bool) -> None:
+        self.debug_hold_active = msg.data
+
     def servo_cycle_callback(self, msg: Int32) -> None:
         if msg.data == self.current_cycle_id:
             return
 
         previous_cycle_id = self.current_cycle_id
+        if self.goal_handle is not None and previous_cycle_id > 0:
+            self._cancel_goal_handle(previous_cycle_id, 'new servo cycle superseded active MoveIt coarse-position goal')
         self.current_cycle_id = msg.data
         self.move_group_goal_sent = False
         self.move_group_done = False
         self.goal_handle = None
+        self.goal_handle_cycle_id = 0
         self.last_attempt_time = None
         self.waiting_for_server_logged = False
         self.consecutive_moveit_failures = 0
@@ -128,6 +139,9 @@ class PregraspCoordinator(Node):
         self.servo_enable_pub.publish(msg)
 
     def control_loop(self) -> None:
+        if self.debug_hold_active:
+            return
+
         if self.move_group_done or self.fallback_servo_enabled or self.move_group_goal_sent:
             return
 
@@ -166,7 +180,9 @@ class PregraspCoordinator(Node):
         self.get_logger().info('发送 MoveIt 粗定位目标到 pre_grasp')
         self._log_event(self.current_cycle_id, 'moveit_goal_sent', '发送 MoveIt 粗定位目标到 pre_grasp')
         future = self.move_group_client.send_goal_async(goal)
-        future.add_done_callback(self._handle_goal_response)
+        future.add_done_callback(
+            lambda done_future, cycle_id=self.current_cycle_id: self._handle_goal_response(done_future, cycle_id)
+        )
 
     def _build_goal(self, target: PoseStamped) -> MoveGroup.Goal:
         goal = MoveGroup.Goal()
@@ -215,15 +231,27 @@ class PregraspCoordinator(Node):
 
         return constraints
 
-    def _handle_goal_response(self, future) -> None:
+    def _handle_goal_response(self, future, cycle_id: int) -> None:
         try:
-            self.goal_handle = future.result()
+            goal_handle = future.result()
         except Exception as exc:  # noqa: BLE001
+            if cycle_id != self.current_cycle_id:
+                return
             self.move_group_goal_sent = False
             self.get_logger().warn(f'发送 MoveIt 目标失败: {exc}')
             self._register_moveit_failure(f'发送 MoveIt 目标失败: {exc}')
             return
 
+        if cycle_id != self.current_cycle_id:
+            if goal_handle is not None and goal_handle.accepted:
+                self.goal_handle = goal_handle
+                self.goal_handle_cycle_id = cycle_id
+                self._cancel_goal_handle(cycle_id, 'stale MoveIt goal response ignored after cycle switch')
+            self._log_event(cycle_id, 'stale_moveit_goal_ignored', 'ignored stale MoveIt goal response after cycle switch')
+            return
+
+        self.goal_handle = goal_handle
+        self.goal_handle_cycle_id = cycle_id
         if not self.goal_handle.accepted:
             self.move_group_goal_sent = False
             self.get_logger().warn('MoveIt 拒绝了 pre_grasp 粗定位目标')
@@ -231,29 +259,68 @@ class PregraspCoordinator(Node):
             return
 
         result_future = self.goal_handle.get_result_async()
-        result_future.add_done_callback(self._handle_move_result)
+        result_future.add_done_callback(
+            lambda done_future, goal_cycle_id=cycle_id: self._handle_move_result(done_future, goal_cycle_id)
+        )
 
-    def _handle_move_result(self, future) -> None:
+    def _handle_move_result(self, future, cycle_id: int) -> None:
         try:
             result = future.result().result
         except Exception as exc:  # noqa: BLE001
+            if cycle_id != self.current_cycle_id:
+                return
             self.move_group_goal_sent = False
             self.get_logger().warn(f'获取 MoveIt 执行结果失败: {exc}')
             self._register_moveit_failure(f'获取 MoveIt 执行结果失败: {exc}')
+            return
+
+        if cycle_id != self.current_cycle_id:
+            self._log_event(cycle_id, 'stale_moveit_result_ignored', 'ignored stale MoveIt result after cycle switch')
             return
 
         if result.error_code.val == 1:
             self.move_group_done = True
             self.fallback_servo_enabled = False
             self.consecutive_moveit_failures = 0
+            self.goal_handle = None
+            self.goal_handle_cycle_id = 0
             mode = 'plan-only' if self.plan_only else 'plan-and-execute'
             self.get_logger().info(f'MoveIt 粗定位成功（{mode}），开始使能视觉伺服')
             self._log_event(self.last_goal_cycle_id, 'moveit_success', f'MoveIt 粗定位成功（{mode}）')
             return
 
         self.move_group_goal_sent = False
+        self.goal_handle = None
+        self.goal_handle_cycle_id = 0
         self.get_logger().warn(f'MoveIt 粗定位失败，错误码 {result.error_code.val}')
         self._register_moveit_failure(f'MoveIt 粗定位失败，错误码 {result.error_code.val}')
+
+    def _cancel_goal_handle(self, cycle_id: int, reason: str) -> None:
+        if self.goal_handle is None:
+            return
+
+        try:
+            cancel_future = self.goal_handle.cancel_goal_async()
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f'取消 MoveIt 目标失败: {exc}')
+            self._log_event(cycle_id, 'moveit_goal_cancel_failed', f'failed to cancel MoveIt goal: {exc}')
+            return
+
+        cancel_future.add_done_callback(
+            lambda done_future, stale_cycle_id=cycle_id, detail=reason: self._handle_cancel_response(
+                done_future, stale_cycle_id, detail
+            )
+        )
+
+    def _handle_cancel_response(self, future, cycle_id: int, reason: str) -> None:
+        try:
+            future.result()
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f'获取 MoveIt 取消结果失败: {exc}')
+            self._log_event(cycle_id, 'moveit_goal_cancel_failed', f'failed to obtain MoveIt cancel result: {exc}')
+            return
+
+        self._log_event(cycle_id, 'moveit_goal_cancelled', reason)
 
     def _register_moveit_failure(self, detail: str) -> None:
         self.consecutive_moveit_failures += 1

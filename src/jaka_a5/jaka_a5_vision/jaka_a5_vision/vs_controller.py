@@ -11,7 +11,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from ros_gz_interfaces.msg import Entity
 from ros_gz_interfaces.srv import SetEntityPose
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Bool, Int32
+from std_msgs.msg import Bool, Int32, String
 from tf2_ros import Buffer, TransformException, TransformListener
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
@@ -206,14 +206,16 @@ class VisualServoController(Node):
         self.declare_parameter('group_name', 'manipulator')
         self.declare_parameter('battery_model_name', 'battery_with_tag')
         self.declare_parameter('hover_distance', 0.16)
-        self.declare_parameter('grasp_distance', 0.03)
+        self.declare_parameter('grasp_distance', 0.10)
         self.declare_parameter('xy_tolerance', 0.012)
         self.declare_parameter('z_tolerance', 0.015)
+        self.declare_parameter('grasp_pose_hold_duration', 5.0)
         self.declare_parameter('align_loss_grace_cycles', 5)
         self.declare_parameter('side_approach_loss_grace_cycles', 8)
         self.declare_parameter('side_approach_settle_duration', 2.0)
         self.declare_parameter('side_approach_reacquire_timeout', 6.0)
         self.declare_parameter('standby_search_start_delay', 2.0)
+        self.declare_parameter('initial_search_freeze_duration', 4.0)
         self.declare_parameter('initial_tag_confirm_duration', 0.2)
         self.declare_parameter('trackable_target_timeout', 2.5)
         self.declare_parameter(
@@ -234,11 +236,19 @@ class VisualServoController(Node):
         self.declare_parameter('search_spiral_start_angle', 0.0)
         self.declare_parameter('search_ik_failure_reset_threshold', 3)
         self.declare_parameter('search_joint_window', [0.10, 0.12, 0.12, 0.22, 0.22, 0.35])
+        self.declare_parameter('search_joint_step_limits', [0.10, 0.12, 0.12, 0.16, 0.16, 0.22])
         self.declare_parameter('search_max_joint_step', 0.18)
+        self.declare_parameter('servo_joint_step_limits', [0.09, 0.11, 0.11, 0.16, 0.18, 0.20])
+        self.declare_parameter('servo_joint_cost_weights', [2.2, 2.8, 2.8, 1.0, 0.8, 0.6])
+        self.declare_parameter('servo_joint_cost_threshold', 0.95)
+        self.declare_parameter('accepted_joint_seed_max_delta', 0.18)
+        self.declare_parameter('angle_wrap_joints', ['joint_1', 'joint_5', 'joint_6'])
         self.declare_parameter('servo_max_joint_step', 0.25)
         self.declare_parameter('xy_gain', 0.7)
         self.declare_parameter('z_gain', 0.6)
-        self.declare_parameter('max_servo_step', 0.025)
+        self.declare_parameter('max_servo_step', 0.015)
+        self.declare_parameter('search_trajectory_time', 0.8)
+        self.declare_parameter('servo_trajectory_time', 1.0)
         self.declare_parameter('trajectory_time', 0.8)
         self.declare_parameter('joint_tolerance', 0.04)
         self.declare_parameter('command_timeout', 2.5)
@@ -257,8 +267,12 @@ class VisualServoController(Node):
         self.declare_parameter('pre_grasp_topic', '/task_frames/pre_grasp')
         self.declare_parameter('grasp_target_topic', '/task_frames/grasp_target')
         self.declare_parameter('place_target_topic', '/task_frames/place_target')
+        self.declare_parameter('use_moveit_coarse_positioning', False)
         self.declare_parameter('servo_enable_topic', '')
         self.declare_parameter('servo_cycle_topic', '/visual_servo/cycle_id')
+        self.declare_parameter('debug_pause_on_state_transition', False)
+        self.declare_parameter('debug_step_topic', '/visual_servo/debug_step')
+        self.declare_parameter('debug_hold_topic', '/visual_servo/debug_hold')
         self.declare_parameter('event_log_path', '/tmp/jaka_a5_experiment_log.csv')
 
         self.joint_names = list(self.get_parameter('joint_names').value)
@@ -278,6 +292,9 @@ class VisualServoController(Node):
         self.grasp_distance = float(self.get_parameter('grasp_distance').value)
         self.xy_tolerance = float(self.get_parameter('xy_tolerance').value)
         self.z_tolerance = float(self.get_parameter('z_tolerance').value)
+        self.grasp_pose_hold_duration = max(
+            0.0, float(self.get_parameter('grasp_pose_hold_duration').value)
+        )
         self.align_loss_grace_cycles = max(1, int(self.get_parameter('align_loss_grace_cycles').value))
         self.side_approach_loss_grace_cycles = max(
             1, int(self.get_parameter('side_approach_loss_grace_cycles').value)
@@ -290,6 +307,10 @@ class VisualServoController(Node):
         )
         self.standby_search_start_delay = max(
             0.0, float(self.get_parameter('standby_search_start_delay').value)
+        )
+        self.initial_search_freeze_duration = max(
+            self.standby_search_start_delay,
+            float(self.get_parameter('initial_search_freeze_duration').value),
         )
         self.initial_tag_confirm_duration = max(
             0.0, float(self.get_parameter('initial_tag_confirm_duration').value)
@@ -317,11 +338,25 @@ class VisualServoController(Node):
         self.search_joint_window = [
             float(value) for value in self.get_parameter('search_joint_window').value
         ]
+        self.search_joint_step_limits = self._resolve_joint_vector_parameter('search_joint_step_limits')
         self.search_max_joint_step = max(0.01, float(self.get_parameter('search_max_joint_step').value))
+        self.servo_joint_step_limits = self._resolve_joint_vector_parameter('servo_joint_step_limits')
+        self.servo_joint_cost_weights = self._resolve_weight_vector_parameter('servo_joint_cost_weights')
+        self.servo_joint_cost_threshold = max(
+            0.0, float(self.get_parameter('servo_joint_cost_threshold').value)
+        )
+        self.accepted_joint_seed_max_delta = max(
+            0.0, float(self.get_parameter('accepted_joint_seed_max_delta').value)
+        )
+        self.angle_wrap_joints = {
+            str(value) for value in self.get_parameter('angle_wrap_joints').value
+        }
         self.servo_max_joint_step = max(0.01, float(self.get_parameter('servo_max_joint_step').value))
         self.xy_gain = float(self.get_parameter('xy_gain').value)
         self.z_gain = float(self.get_parameter('z_gain').value)
         self.max_servo_step = float(self.get_parameter('max_servo_step').value)
+        self.search_trajectory_time = max(0.05, float(self.get_parameter('search_trajectory_time').value))
+        self.servo_trajectory_time = max(0.05, float(self.get_parameter('servo_trajectory_time').value))
         self.trajectory_time = float(self.get_parameter('trajectory_time').value)
         self.joint_tolerance = float(self.get_parameter('joint_tolerance').value)
         self.command_timeout = float(self.get_parameter('command_timeout').value)
@@ -343,8 +378,16 @@ class VisualServoController(Node):
         self.pre_grasp_topic = self.get_parameter('pre_grasp_topic').value
         self.grasp_target_topic = self.get_parameter('grasp_target_topic').value
         self.place_target_topic = self.get_parameter('place_target_topic').value
+        self.use_moveit_coarse_positioning = bool(
+            self.get_parameter('use_moveit_coarse_positioning').value
+        )
         self.servo_enable_topic = str(self.get_parameter('servo_enable_topic').value)
         self.servo_cycle_topic = str(self.get_parameter('servo_cycle_topic').value)
+        self.debug_pause_on_state_transition = bool(
+            self.get_parameter('debug_pause_on_state_transition').value
+        )
+        self.debug_step_topic = str(self.get_parameter('debug_step_topic').value)
+        self.debug_hold_topic = str(self.get_parameter('debug_hold_topic').value)
         self.event_log_path = str(self.get_parameter('event_log_path').value)
 
         self.state = ServoState.S0_STANDBY
@@ -355,6 +398,7 @@ class VisualServoController(Node):
         self.last_tag_pose_world: Optional[PoseStamped] = None
         self.last_battery_center_pose: Optional[PoseStamped] = None
         self.commanded_joint_positions: Optional[List[float]] = None
+        self.last_accepted_joint_positions: Optional[List[float]] = None
         self.last_command_time = None
         self.last_target_feedback_time = None
         self.awaiting_motion = False
@@ -383,6 +427,8 @@ class VisualServoController(Node):
         self.frozen_grasp_transform: Optional[TransformData] = None
         self.search_ik_failure_count = 0
         self.align_target_missing_cycles = 0
+        self.align_goal_hold_start_time = None
+        self.align_goal_hold_logged = False
         self.side_approach_target_missing_cycles = 0
         self.side_approach_enable_time = None
         self.side_approach_settle_logged = False
@@ -395,6 +441,9 @@ class VisualServoController(Node):
         self.last_confirmation_gate_reason: Optional[str] = None
         self.cycle_id = 0
         self.active_cycle_id = 0
+        self.debug_waiting_for_step = False
+        self.debug_wait_state: Optional[ServoState] = None
+        self.debug_wait_reason: Optional[str] = None
         self.standby_enter_wall_time = time.monotonic()
         self.state_enter_time = self.get_clock().now()
         self.event_logger = CsvExperimentLogger(self.event_log_path)
@@ -407,10 +456,20 @@ class VisualServoController(Node):
         self.grasp_target_pub = self.create_publisher(PoseStamped, self.grasp_target_topic, 10)
         self.place_target_pub = self.create_publisher(PoseStamped, self.place_target_topic, 10)
         self.servo_cycle_pub = self.create_publisher(Int32, self.servo_cycle_topic, 10)
+        debug_hold_qos = QoSProfile(depth=1)
+        debug_hold_qos.reliability = ReliabilityPolicy.RELIABLE
+        debug_hold_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self.debug_hold_pub = self.create_publisher(Bool, self.debug_hold_topic, debug_hold_qos)
         self.target_sub = self.create_subscription(PoseStamped, self.target_topic, self.target_callback, 10)
         self.tag_pose_world_sub = self.create_subscription(PoseStamped, self.tag_pose_world_topic, self.tag_pose_world_callback, 10)
         self.battery_center_sub = self.create_subscription(PoseStamped, self.battery_center_topic, self.battery_center_callback, 10)
         self.joint_state_sub = self.create_subscription(JointState, self.joint_state_topic, self.joint_state_callback, 20)
+        self.debug_step_sub = self.create_subscription(
+            String,
+            self.debug_step_topic,
+            self.debug_step_callback,
+            10,
+        )
         self.servo_enable_sub = None
         if self.servo_enable_topic:
             servo_enable_qos = QoSProfile(depth=1)
@@ -427,6 +486,7 @@ class VisualServoController(Node):
         self.set_entity_pose_client = self.create_client(SetEntityPose, self.set_entity_pose_service_name)
 
         self.control_timer = self.create_timer(0.2, self.control_loop)
+        self._publish_debug_hold(False)
         self.get_logger().info('IK visual servo controller started')
         self._log_event('controller_started', f'CSV logging enabled at {self.event_log_path}')
 
@@ -454,6 +514,26 @@ class VisualServoController(Node):
         if not self.servo_enabled:
             self.task_cycle_complete = False
 
+    def debug_step_callback(self, msg: String) -> None:
+        command = msg.data.strip().lower()
+        if command not in {'', 'next', 'continue', 'resume', 'step'}:
+            self.get_logger().info(
+                f'Ignoring debug step command "{msg.data}". Use one of: next, continue, resume, step'
+            )
+            return
+
+        if not self.debug_waiting_for_step:
+            self.get_logger().info('Debug step command received, but the state machine is not paused')
+            return
+
+        waiting_state = self.debug_wait_state.value if self.debug_wait_state is not None else self.state.value
+        self.debug_waiting_for_step = False
+        self.debug_wait_state = None
+        self.debug_wait_reason = None
+        self._publish_debug_hold(False)
+        self.get_logger().info(f'Debug step received, resuming state machine from {waiting_state}')
+        self._log_event('debug_step_resume', f'resumed state machine from {waiting_state}')
+
     def joint_state_callback(self, msg: JointState) -> None:
         for name, position in zip(msg.name, msg.position):
             self.current_joint_state[name] = position
@@ -462,14 +542,22 @@ class VisualServoController(Node):
         self._update_attached_battery_pose()
         self._update_target_confirmation()
 
+        if self.debug_waiting_for_step:
+            return
+
         if self.state == ServoState.S0_STANDBY and not self.task_cycle_complete and self.target_confirmed:
             self._freeze_task_targets()
             self._start_cycle_if_needed('fresh AprilTag target acquired')
-            self._publish_cycle_id()
-            self._set_state(
-                ServoState.S1_SIDE_APPROACH,
-                'Target confirmed during fan search, waiting for coarse side-approach completion',
-            )
+            if self.use_moveit_coarse_positioning:
+                self._publish_cycle_id()
+                transition_reason = (
+                    'Target confirmed during fan search, waiting for coarse side-approach completion'
+                )
+            else:
+                transition_reason = (
+                    'Target confirmed during fan search, start direct visual coarse alignment to hover pose'
+                )
+            self._set_state(ServoState.S1_SIDE_APPROACH, transition_reason)
 
         self._publish_task_frames()
 
@@ -498,83 +586,116 @@ class VisualServoController(Node):
             return
 
         if self.state == ServoState.S1_SIDE_APPROACH:
-            if not self.servo_enabled:
-                if not self.servo_gate_logged:
-                    self.get_logger().info('Visual servo is waiting for external enable signal')
-                    self.servo_gate_logged = True
-                return
+            if self.use_moveit_coarse_positioning:
+                if not self.servo_enabled:
+                    if not self.servo_gate_logged:
+                        self.get_logger().info('Visual servo is waiting for external enable signal')
+                        self.servo_gate_logged = True
+                    return
 
-            if (
-                self.last_servo_enable_update_time is None
-                or self.last_servo_enable_update_time < self.state_enter_time
-            ):
-                if not self.servo_gate_logged:
-                    self.get_logger().info('Waiting for coarse-position enable update of current cycle')
-                    self.servo_gate_logged = True
-                return
+                if (
+                    self.last_servo_enable_update_time is None
+                    or self.last_servo_enable_update_time < self.state_enter_time
+                ):
+                    if not self.servo_gate_logged:
+                        self.get_logger().info('Waiting for coarse-position enable update of current cycle')
+                        self.servo_gate_logged = True
+                    return
 
-            if self.side_approach_enable_time is None:
-                self.side_approach_enable_time = self.get_clock().now()
-                self.side_approach_settle_logged = False
+                if self.side_approach_enable_time is None:
+                    self.side_approach_enable_time = self.get_clock().now()
+                    self.side_approach_settle_logged = False
 
-            if self._has_fresh_target():
-                self.side_approach_target_missing_cycles = 0
-                self._set_state(
-                    ServoState.S2_ALIGN,
-                    'Coarse side approach complete, start fine alignment to centered 3 cm grasp pose',
-                )
-                return
-
-            since_enable_sec = (
-                self.get_clock().now() - self.side_approach_enable_time
-            ).nanoseconds / 1e9
-            if since_enable_sec < self.side_approach_settle_duration:
-                if not self.side_approach_settle_logged:
-                    self._log_event(
-                        'target_reacquire_settling',
-                        f'waiting {self.side_approach_settle_duration:.1f}s after coarse positioning '
-                        'before evaluating tag-reacquire timeout',
+                if self._has_fresh_target():
+                    self.side_approach_target_missing_cycles = 0
+                    self._set_state(
+                        ServoState.S2_ALIGN,
+                        'Coarse side approach complete, start fine alignment to centered 3 cm grasp pose',
                     )
-                    self.side_approach_settle_logged = True
+                    return
+
+                since_enable_sec = (
+                    self.get_clock().now() - self.side_approach_enable_time
+                ).nanoseconds / 1e9
+                if since_enable_sec < self.side_approach_settle_duration:
+                    if not self.side_approach_settle_logged:
+                        self._log_event(
+                            'target_reacquire_settling',
+                            f'waiting {self.side_approach_settle_duration:.1f}s after coarse positioning '
+                            'before evaluating tag-reacquire timeout',
+                        )
+                        self.side_approach_settle_logged = True
+                    return
+
+                reacquire_wait_sec = since_enable_sec - self.side_approach_settle_duration
+                if reacquire_wait_sec >= self.side_approach_reacquire_timeout:
+                    self._log_event(
+                        'target_reacquire_timeout',
+                        f'AprilTag not reacquired within {self.side_approach_reacquire_timeout:.1f}s '
+                        'after coarse-position settling; returning to standby',
+                    )
+                    self._set_state(
+                        ServoState.S0_STANDBY,
+                        'AprilTag not reacquired after coarse positioning; restart standby confirmation',
+                    )
                 return
 
-            reacquire_wait_sec = since_enable_sec - self.side_approach_settle_duration
-            if reacquire_wait_sec >= self.side_approach_reacquire_timeout:
+            if not self._has_fresh_target():
+                self.side_approach_target_missing_cycles += 1
+                if self.side_approach_target_missing_cycles < self.side_approach_loss_grace_cycles:
+                    return
                 self._log_event(
-                    'target_reacquire_timeout',
-                    f'AprilTag not reacquired within {self.side_approach_reacquire_timeout:.1f}s '
-                    'after coarse-position settling; returning to standby',
+                    'target_lost',
+                    'AprilTag lost during direct coarse alignment; returning to standby for reacquisition',
                 )
                 self._set_state(
                     ServoState.S0_STANDBY,
-                    'AprilTag not reacquired after coarse positioning; restart standby confirmation',
+                    'AprilTag lost during direct coarse alignment; restart standby confirmation and search gating',
+                )
+                return
+
+            self.side_approach_target_missing_cycles = 0
+            if self._servo_to_tag(self.hover_distance):
+                self._set_state(
+                    ServoState.S2_ALIGN,
+                    'Direct coarse alignment complete, start fine alignment to grasp pose',
                 )
             return
 
-        if not self.servo_enabled:
+        if self.use_moveit_coarse_positioning and not self.servo_enabled:
             if not self.servo_gate_logged:
                 self.get_logger().info('Visual servo is waiting for external enable signal')
                 self.servo_gate_logged = True
             return
 
         if self.state == ServoState.S2_ALIGN:
-            if not self._has_fresh_target():
-                self.align_target_missing_cycles += 1
-                if self.align_target_missing_cycles < self.align_loss_grace_cycles:
-                    return
-                self._log_event('target_lost', 'AprilTag lost during ALIGN; returning to standby for reacquisition')
-                self._set_state(
-                    ServoState.S0_STANDBY,
-                    'AprilTag lost during fine alignment; restart standby confirmation and search gating',
-                )
+            if self.align_goal_hold_start_time is not None:
+                held_duration = (
+                    self.get_clock().now() - self.align_goal_hold_start_time
+                ).nanoseconds / 1e9
+                if held_duration >= self.grasp_pose_hold_duration:
+                    self._set_state(
+                        ServoState.S3_CLAMP,
+                        'AprilTag centered and grasp-ready pose held for required duration, clamp old battery',
+                    )
                 return
-            self.align_target_missing_cycles = 0
 
-            if self._servo_to_tag(self.grasp_distance):
-                self._set_state(
-                    ServoState.S3_CLAMP,
-                    'AprilTag centered and grasp distance reached, clamp old battery',
-                )
+            if self._tag_within_servo_tolerance(self.grasp_distance, allow_trackable_target=True):
+                self.align_goal_hold_start_time = self.get_clock().now()
+                self.align_goal_hold_logged = False
+
+                if not self.align_goal_hold_logged:
+                    self._log_event(
+                        'grasp_pose_hold_started',
+                        f'grasp-ready pose reached at camera-tag distance {self.grasp_distance:.3f} m; '
+                        f'holding for {self.grasp_pose_hold_duration:.1f}s before clamp',
+                    )
+                    self.align_goal_hold_logged = True
+                return
+
+            self.align_goal_hold_start_time = None
+            self.align_goal_hold_logged = False
+            self._servo_to_tag(self.grasp_distance, allow_trackable_target=True)
             return
 
         if self.state == ServoState.S3_CLAMP:
@@ -644,8 +765,7 @@ class VisualServoController(Node):
             return False
 
         receive_age = (self.get_clock().now() - self.last_target_received_time).nanoseconds / 1e9
-        stamp_age = (self.get_clock().now() - self.last_target_stamp).nanoseconds / 1e9
-        return receive_age <= self.target_timeout and stamp_age <= self.target_timeout
+        return receive_age <= self.target_timeout
 
     def _has_trackable_target(self) -> bool:
         if self.last_target_pose is None or self.last_target_received_time is None:
@@ -677,14 +797,126 @@ class VisualServoController(Node):
             return None
         return [self.current_joint_state[name] for name in self.joint_names]
 
+    def _resolve_joint_vector_parameter(self, parameter_name: str) -> List[float]:
+        values = [float(value) for value in self.get_parameter(parameter_name).value]
+        if len(values) != len(self.joint_names):
+            self.get_logger().warn(
+                f'{parameter_name} length {len(values)} does not match manipulator joint count {len(self.joint_names)}; '
+                'falling back to repeated final value'
+            )
+            fallback_value = values[-1] if values else 0.1
+            values = [fallback_value for _ in self.joint_names]
+        return values
+
+    def _resolve_weight_vector_parameter(self, parameter_name: str) -> List[float]:
+        values = [float(value) for value in self.get_parameter(parameter_name).value]
+        if len(values) != len(self.joint_names):
+            self.get_logger().warn(
+                f'{parameter_name} length {len(values)} does not match manipulator joint count {len(self.joint_names)}; '
+                'falling back to uniform weights'
+            )
+            values = [1.0 for _ in self.joint_names]
+        return values
+
+    def _preferred_ik_seed_positions(self) -> Optional[List[float]]:
+        current_positions = self._joint_position_vector()
+        if current_positions is None:
+            return None
+        if self.last_accepted_joint_positions is None:
+            return current_positions
+
+        max_delta = max(
+            abs(self.last_accepted_joint_positions[index] - current_positions[index])
+            for index in range(len(self.joint_names))
+        )
+        if max_delta > self.accepted_joint_seed_max_delta:
+            return current_positions
+        return list(self.last_accepted_joint_positions)
+
+    def _joint_step_limits_for_state(self, state: Optional[ServoState]) -> Optional[List[float]]:
+        if state == ServoState.S0_STANDBY:
+            return self.search_joint_step_limits
+        if state in {ServoState.S1_SIDE_APPROACH, ServoState.S2_ALIGN}:
+            return self.servo_joint_step_limits
+        return None
+
+    def _trajectory_time_for_state(self, state: Optional[ServoState]) -> float:
+        if state == ServoState.S0_STANDBY:
+            return self.search_trajectory_time
+        if state in {ServoState.S1_SIDE_APPROACH, ServoState.S2_ALIGN}:
+            return self.servo_trajectory_time
+        return self.trajectory_time
+
+    def _apply_joint_step_limits(
+        self,
+        candidate_positions: List[float],
+        state: Optional[ServoState],
+    ) -> List[float]:
+        current_positions = self._joint_position_vector()
+        joint_step_limits = self._joint_step_limits_for_state(state)
+        if current_positions is None or joint_step_limits is None:
+            return list(candidate_positions)
+
+        limited_positions = list(candidate_positions)
+        for index in range(len(limited_positions)):
+            delta = limited_positions[index] - current_positions[index]
+            limit = abs(joint_step_limits[index])
+            limited_positions[index] = current_positions[index] + clamp(delta, limit)
+        return limited_positions
+
+    def _per_joint_limit_violations(
+        self,
+        candidate_positions: List[float],
+        current_positions: List[float],
+        joint_step_limits: List[float],
+    ) -> List[str]:
+        violations: List[str] = []
+        for index, joint_name in enumerate(self.joint_names):
+            delta = abs(candidate_positions[index] - current_positions[index])
+            if delta > joint_step_limits[index]:
+                violations.append(f'{joint_name}:{delta:.3f}>{joint_step_limits[index]:.3f}')
+        return violations
+
+    def _weighted_joint_cost(self, candidate_positions: List[float], current_positions: List[float]) -> float:
+        return sum(
+            self.servo_joint_cost_weights[index] * abs(candidate_positions[index] - current_positions[index])
+            for index in range(len(self.joint_names))
+        )
+
+    def _normalize_angle_wrap_joints(
+        self,
+        candidate_positions: List[float],
+        reference_positions: List[float],
+    ) -> List[float]:
+        normalized_positions = list(candidate_positions)
+        for index, joint_name in enumerate(self.joint_names):
+            if joint_name not in self.angle_wrap_joints:
+                continue
+
+            delta = normalized_positions[index] - reference_positions[index]
+            while delta > math.pi:
+                normalized_positions[index] -= 2.0 * math.pi
+                delta -= 2.0 * math.pi
+            while delta < -math.pi:
+                normalized_positions[index] += 2.0 * math.pi
+                delta += 2.0 * math.pi
+        return normalized_positions
+
     def _hold_search_observation_pose(self) -> None:
-        if self._has_fresh_target() or self.fresh_target_hold_start_time is not None:
+        if self._should_pause_standby_search():
             if not self.search_pause_logged:
-                self.get_logger().info('Tag 已进入可确认窗口，暂停继续搜索并保持当前视角')
-                self._log_event(
-                    'search_paused',
-                    'fresh target visible in standby; pausing observation-pose return and spiral search',
-                )
+                if self._has_trackable_target() or self.fresh_target_hold_start_time is not None:
+                    self.get_logger().info('Tag 已进入可确认窗口，暂停继续搜索并保持当前视角')
+                    self._log_event(
+                        'search_paused',
+                        'target remains trackable in standby; pausing observation-pose return and fan search',
+                    )
+                else:
+                    self.get_logger().info('启动宽限期内保持机械臂静止，等待初始 Tag 进入稳定观测')
+                    self._log_event(
+                        'search_startup_freeze',
+                        'holding manipulator still during startup grace window before enabling standby search motion',
+                    )
                 self.search_pause_logged = True
             if (
                 not self.search_halt_commanded
@@ -698,7 +930,7 @@ class VisualServoController(Node):
                     self.search_halt_commanded = True
                     self._log_event(
                         'search_motion_halted',
-                        'fresh target visible in standby; commanding current joint pose to stop search motion',
+                        'standby search motion halted while waiting for stable initial target acquisition',
                     )
             return
 
@@ -765,6 +997,18 @@ class VisualServoController(Node):
         self._log_event('search_pose_commanded', 'moving to fixed observation pose for AprilTag acquisition')
         self._publish_trajectory(search_anchor_joints)
         self.search_pose_commanded = True
+
+    def _should_pause_standby_search(self) -> bool:
+        if self._has_trackable_target() or self.fresh_target_hold_start_time is not None:
+            return True
+
+        standby_age = time.monotonic() - self.standby_enter_wall_time
+        return (
+            self.active_cycle_id == 0
+            and not self.search_pose_commanded
+            and not self.search_sweep_started
+            and standby_age < self.initial_search_freeze_duration
+        )
 
     def _run_search_sweep(self, current: List[float]) -> None:
         fan_waypoints = self._search_fan_waypoints()
@@ -910,17 +1154,33 @@ class VisualServoController(Node):
         pose.orientation = rotation
         return transform_from_pose(pose)
 
-    def _servo_to_tag(self, desired_distance: float) -> bool:
-        if not self._has_fresh_target():
+    def _tag_within_servo_tolerance(
+        self,
+        desired_distance: float,
+        *,
+        allow_trackable_target: bool = False,
+    ) -> bool:
+        target_available = self._has_trackable_target() if allow_trackable_target else self._has_fresh_target()
+        if not target_available or self.last_target_pose is None:
+            return False
+
+        tag = self.last_target_pose.pose.position
+        lateral_error = math.hypot(tag.x, tag.y)
+        distance_error = tag.z - desired_distance
+        return lateral_error < self.xy_tolerance and abs(distance_error) < self.z_tolerance
+
+    def _servo_to_tag(self, desired_distance: float, *, allow_trackable_target: bool = False) -> bool:
+        target_available = self._has_trackable_target() if allow_trackable_target else self._has_fresh_target()
+        if not target_available:
             return False
         desired_tool = self._compute_servo_goal_transform(desired_distance)
         if desired_tool is None:
             return False
-        tag = self.last_target_pose.pose.position
-        lateral_error = math.hypot(tag.x, tag.y)
-        distance_error = tag.z - desired_distance
 
-        if lateral_error < self.xy_tolerance and abs(distance_error) < self.z_tolerance:
+        if self._tag_within_servo_tolerance(
+            desired_distance,
+            allow_trackable_target=allow_trackable_target,
+        ):
             return True
         return self._request_ik_for_transform(desired_tool)
 
@@ -1001,7 +1261,7 @@ class VisualServoController(Node):
             return False
 
         self.service_warning_emitted = False
-        joint_positions = self._joint_position_vector()
+        joint_positions = self._preferred_ik_seed_positions()
         if joint_positions is None:
             return False
 
@@ -1056,9 +1316,13 @@ class VisualServoController(Node):
             return
 
         ordered_positions = [solution_map[name] for name in self.joint_names]
-        if not self._ik_solution_allowed(ordered_positions):
+        reference_positions = self._joint_position_vector()
+        if reference_positions is not None:
+            ordered_positions = self._normalize_angle_wrap_joints(ordered_positions, reference_positions)
+        limited_positions = self._apply_joint_step_limits(ordered_positions, self.last_requested_state)
+        if not self._ik_solution_allowed(limited_positions):
             return
-        self._publish_trajectory(ordered_positions)
+        self._publish_trajectory(limited_positions)
 
     def _ik_solution_allowed(self, candidate_positions: List[float]) -> bool:
         current_positions = self._joint_position_vector()
@@ -1080,11 +1344,16 @@ class VisualServoController(Node):
                 abs(candidate_positions[index] - self.search_observation_joints[index]) > self.search_joint_window[index]
                 for index in range(len(self.joint_names))
             )
-            if exceeds_window or max_step > self.search_max_joint_step:
+            limit_violations = self._per_joint_limit_violations(
+                candidate_positions,
+                current_positions,
+                self.search_joint_step_limits,
+            )
+            if exceeds_window or max_step > self.search_max_joint_step or limit_violations:
                 self.search_ik_failure_count += 1
                 self._log_event(
                     'ik_solution_rejected',
-                    'search IK solution exceeded standby joint window or single-step limit',
+                    'search IK solution exceeded standby joint window or joint-step limit',
                 )
                 if self.search_ik_failure_count >= self.search_ik_failure_reset_threshold:
                     self._reset_search_pattern('search IK solution exceeded joint limits repeatedly')
@@ -1093,29 +1362,51 @@ class VisualServoController(Node):
             return True
 
         if self.last_requested_state in {ServoState.S1_SIDE_APPROACH, ServoState.S2_ALIGN}:
+            limit_violations = self._per_joint_limit_violations(
+                candidate_positions,
+                current_positions,
+                self.servo_joint_step_limits,
+            )
+            if limit_violations:
+                self._log_event(
+                    'ik_solution_rejected',
+                    f'servo IK solution exceeded per-joint limits ({", ".join(limit_violations)})',
+                )
+                return False
             if max_step > self.servo_max_joint_step:
                 self._log_event(
                     'ik_solution_rejected',
                     f'servo IK solution exceeded single-step joint limit ({max_step:.3f} rad)',
                 )
                 return False
+            continuity_cost = self._weighted_joint_cost(candidate_positions, current_positions)
+            if continuity_cost > self.servo_joint_cost_threshold:
+                self._log_event(
+                    'ik_solution_rejected',
+                    f'servo IK solution continuity cost {continuity_cost:.3f} exceeded threshold '
+                    f'{self.servo_joint_cost_threshold:.3f}',
+                )
+                return False
 
         return True
 
     def _publish_trajectory(self, joint_positions: List[float]) -> None:
+        target_positions = self._apply_joint_step_limits(joint_positions, self.state)
         trajectory = JointTrajectory()
         trajectory.header.stamp = self.get_clock().now().to_msg()
         trajectory.joint_names = list(self.joint_names)
 
         point = JointTrajectoryPoint()
-        point.positions = list(joint_positions)
-        point.time_from_start.sec = int(self.trajectory_time)
-        point.time_from_start.nanosec = int((self.trajectory_time - int(self.trajectory_time)) * 1e9)
+        point.positions = list(target_positions)
+        trajectory_time = self._trajectory_time_for_state(self.state)
+        point.time_from_start.sec = int(trajectory_time)
+        point.time_from_start.nanosec = int((trajectory_time - int(trajectory_time)) * 1e9)
 
         trajectory.points.append(point)
         self.trajectory_pub.publish(trajectory)
 
-        self.commanded_joint_positions = list(joint_positions)
+        self.commanded_joint_positions = list(target_positions)
+        self.last_accepted_joint_positions = list(target_positions)
         self.last_command_time = self.get_clock().now()
         self.awaiting_motion = True
         self._log_event('trajectory_commanded', 'published joint trajectory command')
@@ -1212,6 +1503,8 @@ class VisualServoController(Node):
         self.state = new_state
         self.state_enter_time = self.get_clock().now()
         self.align_target_missing_cycles = 0
+        self.align_goal_hold_start_time = None
+        self.align_goal_hold_logged = False
         self.side_approach_target_missing_cycles = 0
         self.side_approach_enable_time = None
         self.side_approach_settle_logged = False
@@ -1249,6 +1542,37 @@ class VisualServoController(Node):
             f'(上一阶段耗时={previous_duration:.2f}s, 原因={reason})'
         )
         self._log_event('state_enter', reason)
+        self._arm_debug_pause_if_needed(previous_state, new_state, reason)
+
+    def _arm_debug_pause_if_needed(
+        self,
+        previous_state: ServoState,
+        new_state: ServoState,
+        reason: str,
+    ) -> None:
+        if not self.debug_pause_on_state_transition:
+            return
+
+        self.debug_waiting_for_step = True
+        self.debug_wait_state = new_state
+        self.debug_wait_reason = reason
+        self._publish_debug_hold(True)
+        self.get_logger().info(
+            'Debug pause armed after state transition. '
+            f'Current state={new_state.value}, previous={previous_state.value}. '
+            f'Reason={reason}. Resume with: '
+            f'ros2 topic pub --once {self.debug_step_topic} std_msgs/msg/String "{{data: next}}"'
+        )
+        self._log_event(
+            'debug_step_wait',
+            f'paused after transition {previous_state.value} -> {new_state.value}; '
+            f'resume with topic {self.debug_step_topic}',
+        )
+
+    def _publish_debug_hold(self, enabled: bool) -> None:
+        msg = Bool()
+        msg.data = enabled
+        self.debug_hold_pub.publish(msg)
 
     def _publish_task_frames(self) -> None:
         if not self._should_publish_target_frames():
